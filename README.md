@@ -174,31 +174,3 @@ Errors are always logged regardless of this setting, at
 `GLib.LogLevelFlags.LEVEL_CRITICAL`, so they won't be missed even with
 logging disabled.
 
-Common issues:
-
-| Symptom | Likely cause |
-|---|---|
-| `gdmenu: could not reach extension` | Extension isn't enabled, or you haven't logged out/in since installing — check `gnome-extensions info gnome-dmenu-by-blueray453` |
-| Call hangs indefinitely | A JS exception was thrown inside the extension before it could emit a signal — check `journalctl -f -o cat SYSLOG_IDENTIFIER=gnome-dmenu-by-blueray453` for details |
-| Typed text doesn't appear / no focus | Extension didn't grab entry focus in time — try clicking inside the box once as a workaround, then file an issue |
-| Menu doesn't reflect `extension.js` edits | Wayland requires a full logout/login to reload shell extension code — there is no in-place reload like X11's `Alt+F2` → `r` |
-| `gdmenu: command not found` | Symlink wasn't created, or `~/.local/bin` isn't on `$PATH` — see Installation step 2 |
-
-## Architecture notes / why it's built this way
-
-- **No `wlr-layer-shell`**: not supported by Mutter, so instead of a
-  standalone client window, this runs as GJS code *inside* the compositor
-  process, using `Main.layoutManager.addChrome()` — the same mechanism
-  GNOME uses for the Activities overview and notification popups.
-- **No `Main.pushModal`/`popModal`**: earlier versions used a full modal
-  grab, but the grab-handle API has changed across GNOME Shell versions
-  (some expect the actor, some expect a returned grab object), which caused
-  hard-to-diagnose crashes. This version relies on `addChrome` + explicit
-  key focus instead — simpler and version-stable, at the cost of not doing
-  a true compositor-level input grab (clicking outside the box does not
-  currently get blocked, only redirected to refocus the entry).
-- **D-Bus signals, not blocking method replies**: `Show()` returns
-  instantly; the actual result comes back later via a `Selected` or
-  `Cancelled` signal. This means a bug in the UI code can never leave a
-  D-Bus method invocation hanging — the caller isn't blocked on a promise
-  the extension has to fulfill correctly, it's just listening for an event.
