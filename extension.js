@@ -32,6 +32,9 @@ class DmenuService {
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_INTERFACE, this);
     }
 
+    // Fire-and-forget: returns immediately, actual result comes via signal.
+    // Nothing about GNOME Shell is left "waiting" on a correct reply, so a
+    // bug in the UI code later can't hang or crash the caller's D-Bus call.
     Show(items) {
         this._extension.show(items);
     }
@@ -83,8 +86,13 @@ const DmenuUI = class {
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
             x_expand: true,
             y_expand: true,
+            reactive: true,
         });
-        this.results_box = new St.BoxLayout({ style_class: 'dmenu-results-box', vertical: true });
+        this.results_box = new St.BoxLayout({
+            style_class: 'dmenu-results-box',
+            vertical: true,
+            reactive: true,
+        });
         this.results_container.set_child(this.results_box);
 
         this.actor.add_child(this.entry);
@@ -95,12 +103,19 @@ const DmenuUI = class {
 
         // Return is consumed internally by ClutterText's 'activate' signal
         // before it would ever reach a key-press-event handler on a parent
-        // actor — so Enter MUST be handled here, not in _onKeyPress below.
+        // actor — so Enter MUST be handled here, not in _onKeyPress.
         clutterText.connect('activate', this._activate.bind(this));
 
-        // Navigation keys (Up/Down/Tab/Escape/Ctrl+Space) are not consumed
-        // by ClutterText in a single-line entry, so these bubble fine.
+        // Navigation keys (Up/Down/Tab/Escape/Ctrl+Space/Shift+Enter) are not
+        // consumed by ClutterText in a single-line entry, so these bubble fine.
         this.actor.connect('key-press-event', this._onKeyPress.bind(this));
+
+        // Clicking anywhere in the menu (background, results area, empty
+        // padding) should refocus the entry, not just clicking the entry itself.
+        this.actor.connect('button-press-event', () => {
+            this.entry.grab_key_focus();
+            return Clutter.EVENT_STOP;
+        });
 
         this._allItems = [];
         this._visibleItems = [];
@@ -238,8 +253,8 @@ const DmenuUI = class {
             this._selectedItems.add(item);
     }
 
-    // Plain Enter: return the multi-selection if any items were toggled,
-    // otherwise just the currently highlighted line.
+    // Plain Enter (or clicking a row): return the multi-selection if any
+    // items were toggled, otherwise just the currently highlighted line.
     _activate() {
         let result = [];
 
@@ -292,6 +307,9 @@ const DmenuUI = class {
         this._scrollStart = Math.max(0, this._scrollStart);
     }
 
+    // Only renders the current page window (ITEMS_PER_PAGE actors max),
+    // regardless of how many lines were piped in — keeps things responsive
+    // with thousands of input lines.
     _render() {
         this.results_box.remove_all_children();
 
@@ -302,6 +320,8 @@ const DmenuUI = class {
                 vertical: false,
                 style_class: 'dmenu-result-row',
                 x_expand: true,
+                reactive: true,
+                track_hover: true,
             });
 
             const marker = new St.Label({
@@ -316,12 +336,39 @@ const DmenuUI = class {
                     ? 'dmenu-result dmenu-result-selected'
                     : 'dmenu-result',
                 x_expand: true,
-                x_align: Clutter.ActorAlign.FILL,   // <-- this is the missing piece
+                x_align: Clutter.ActorAlign.FILL,
                 y_align: Clutter.ActorAlign.CENTER,
             });
 
             row.add_child(marker);
             row.add_child(label);
+
+            // Hover: give clear visual feedback that a row is clickable,
+            // even before the user clicks anything.
+            row.connect('enter-event', () => {
+                label.add_style_class_name('dmenu-result-hover');
+                return Clutter.EVENT_PROPAGATE;
+            });
+            row.connect('leave-event', () => {
+                label.remove_style_class_name('dmenu-result-hover');
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            // Click: flash a distinct "clicked" style briefly so the user
+            // sees confirmation of what was picked, then activate.
+            const rowIndex = i;
+            row.connect('button-press-event', () => {
+                label.remove_style_class_name('dmenu-result-hover');
+                label.add_style_class_name('dmenu-result-clicked');
+                this._selectedIndex = rowIndex;
+
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                    this._activate();
+                    return GLib.SOURCE_REMOVE;
+                });
+                return Clutter.EVENT_STOP;
+            });
+
             this.results_box.add_child(row);
         }
     }

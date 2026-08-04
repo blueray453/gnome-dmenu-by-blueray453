@@ -1,6 +1,25 @@
+/* Solarized Dark palette
+   base03  #002b36  background
+   base02  #073642  background highlights
+   base01  #586e75  secondary content
+   base00  #657b83  body text (dark bg)
+   base0   #839496  body text (light on dark)
+   base1   #93a1a1  optional emphasis
+   base2   #eee8d5  background (light)
+   base3   #fdf6e3  background (light, brightest)
+   yellow  #b58900
+   orange  #cb4b16
+   red     #dc322f
+   magenta #d33682
+   violet  #6c71c4
+   blue    #268bd2
+   cyan    #2aa198
+   green   #859900
+*/
+
 .dmenu-container {
-    background-color: rgba(30, 30, 30, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.15);
+    background-color: rgba(0, 43, 54, 0.97);       /* base03 */
+    border: 1px solid #073642;                      /* base02 */
     border-radius: 16px;
     padding: 24px;
     spacing: 14px;
@@ -10,8 +29,8 @@
     font-size: 36px;
     padding: 18px 16px;
     border-radius: 10px;
-    background-color: rgba(255, 255, 255, 0.08);
-    color: #ffffff;
+    background-color: #073642;                      /* base02 */
+    color: #eee8d5;                                  /* base2 */
 }
 
 .dmenu-results-container {
@@ -24,19 +43,30 @@
 
 .dmenu-marker {
     font-size: 30px;
-    color: #5dade2;
-    width: 32px;          /* fixed column so text doesn't shift left/right on toggle */
+    color: #2aa198;                                  /* cyan */
+    width: 32px;
     text-align: center;
 }
 
 .dmenu-result {
     font-size: 30px;
     padding: 14px 16px;
-    color: #cccccc;
+    color: #839496;                                  /* base0 */
     border-radius: 8px;
 }
 
 .dmenu-result-selected {
-    background-color: rgba(53, 132, 228, 0.5);
-    color: #ffffff;
+    background-color: rgba(38, 139, 210, 0.45);       /* blue */
+    color: #fdf6e3;                                  /* base3 */
+}
+
+/* Mouse hovering over a row */
+.dmenu-result-hover {
+    background-color: rgba(88, 110, 117, 0.25);       /* base01 */
+}
+
+/* Brief flash on click, before the menu closes */
+.dmenu-result-clicked {
+    background-color: rgba(133, 153, 0, 0.6);         /* green */
+    color: #fdf6e3;                                  /* base3 */
 }
