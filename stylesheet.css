@@ -48,6 +48,13 @@
     text-align: center;
 }
 
+/* Icon styling */
+.dmenu-icon {
+    width: 32px;
+    height: 32px;
+    padding: 0 10px 0 0;
+}
+
 .dmenu-result {
     font-size: 30px;
     padding: 14px 16px;

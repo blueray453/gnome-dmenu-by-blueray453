@@ -1,7 +1,7 @@
 #!/usr/bin/env gjs
 
 imports.gi.versions.Gio = '2.0';
-const {Gio, GLib} = imports.gi;
+const { Gio, GLib } = imports.gi;
 const System = imports.system;
 
 let GioUnix;
@@ -13,25 +13,66 @@ const INTERFACE_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 
 function readStdinLines() {
     const unixStream = GioUnix
-        ? new GioUnix.InputStream({fd: 0, close_fd: false})
-        : new Gio.UnixInputStream({fd: 0, close_fd: false});
-    const dataStream = new Gio.DataInputStream({base_stream: unixStream});
+        ? new GioUnix.InputStream({ fd: 0, close_fd: false })
+        : new Gio.UnixInputStream({ fd: 0, close_fd: false });
+    const dataStream = new Gio.DataInputStream({ base_stream: unixStream });
 
     const lines = [];
     while (true) {
         const [line] = dataStream.read_line_utf8(null);
-        if (line === null)
-            break;
-        if (line.length > 0)
-            lines.push(line);
+        if (line === null) break;
+        if (line.length > 0) lines.push(line);
     }
     return lines;
 }
 
+function showHelp() {
+    print(`
+Usage:
+  gdmenu [OPTIONS]
+
+Options:
+  --drun        Show applications (app launcher)
+  --window      Show open windows (window switcher)
+  --multi       Enable multi‑select (default: off)
+  --help        Show this help
+
+If no mode is given, gdmenu reads lines from stdin and displays them.
+`);
+}
+
 function main() {
-    const lines = readStdinLines();
-    if (lines.length === 0)
-        System.exit(1);
+    // Parse command line arguments
+    let mode = null;        // 'drun', 'window', or null (stdin)
+    let multi = false;
+
+    for (let i = 0; i < ARGV.length; i++) {
+        const arg = ARGV[i];
+        if (arg === '--help' || arg === '-h') {
+            showHelp();
+            System.exit(0);
+        } else if (arg === '--drun') {
+            mode = 'drun';
+        } else if (arg === '--window') {
+            mode = 'window';
+        } else if (arg === '--multi') {
+            multi = true;
+        } else {
+            printerr(`Unknown option: ${arg}`);
+            showHelp();
+            System.exit(1);
+        }
+    }
+
+    // If no mode, read from stdin
+    let lines = [];
+    if (mode === null) {
+        lines = readStdinLines();
+        if (lines.length === 0) {
+            printerr('gdmenu: no input provided');
+            System.exit(1);
+        }
+    }
 
     const loop = GLib.MainLoop.new(null, false);
     let result = null;
@@ -44,13 +85,11 @@ function main() {
         System.exit(2);
     }
 
-    // Subscribe to both outcomes BEFORE calling Show(), so we can't
-    // miss a signal that fires while we're still setting up.
+    // Subscribe to both outcomes BEFORE calling Show, so we can't miss a signal
     bus.signal_subscribe(
         null, INTERFACE_NAME, 'Selected', OBJECT_PATH, null,
         Gio.DBusSignalFlags.NONE,
         (conn, sender, path, iface, signal, params) => {
-            // Selected now carries an array of strings (multi-select support).
             result = params.deepUnpack()[0];
             loop.quit();
         }
@@ -83,25 +122,43 @@ function main() {
     }
 
     try {
-        // Fire-and-forget: Show() returns immediately, the real result
-        // comes back later via the Selected/Cancelled signal above.
-        proxy.call_sync(
-            'Show',
-            new GLib.Variant('(as)', [lines]),
-            Gio.DBusCallFlags.NONE,
-            -1,
-            null
-        );
+        if (mode === 'drun') {
+            proxy.call_sync(
+                'ShowApps',
+                new GLib.Variant('(b)', [multi]),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                null
+            );
+        } else if (mode === 'window') {
+            proxy.call_sync(
+                'ShowWindows',
+                new GLib.Variant('(b)', [multi]),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                null
+            );
+        } else {
+            // stdin mode: now we pass the multi flag as well
+            proxy.call_sync(
+                'Show',
+                new GLib.Variant('(asb)', [lines, multi]),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                null
+            );
+        }
     } catch (e) {
-        printerr(`gdmenu: Show() call failed: ${e.message}`);
+        printerr(`gdmenu: D‑Bus call failed: ${e.message}`);
         System.exit(2);
     }
 
     loop.run();
 
     if (result && result.length > 0) {
-        for (const item of result)
+        for (const item of result) {
             print(item);
+        }
         System.exit(0);
     } else {
         System.exit(1);
