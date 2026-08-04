@@ -1,7 +1,7 @@
 # gnome-dmenu-by-blueray453
 
-A `dmenu`/`rofi`-style application launcher and text-selection prompt for
-**GNOME Shell on Wayland**.
+A `dmenu`/`rofi`-style application launcher, window switcher, and
+text-selection prompt for **GNOME Shell on Wayland**.
 
 GNOME's Wayland compositor (Mutter) does not support the `wlr-layer-shell`
 protocol, so traditional tools like `rofi` and `wofi` cannot overlay
@@ -13,31 +13,29 @@ process itself and uses the compositor's own APIs (`St`, `Clutter`,
 required.
 
 A small CLI helper (`cli/gdmenu`) talks to the extension over D-Bus, so you
-can pipe text into it from shell scripts exactly like classic `dmenu`
+can pipe text into it from shell scripts exactly like classic `dmenu`, or
+use it directly as an app launcher / window switcher / file picker.
 
 ## Features
 
-- Full-screen overlay drawn above all other windows, no layer-shell needed
-- Fuzzy substring filtering as you type (multi-word, order-independent)
+- Full-screen or floating overlay drawn above all other windows, no
+  layer-shell needed
+- Four modes: plain text (stdin), app launcher, window switcher, file paths
+- Fuzzy substring filtering as you type (multi-word, order-independent),
+  with matched text bolded in the results
+- Icons shown for apps, windows, and file paths
 - Keyboard navigation (arrows, Tab, etc.)
-- **Multi-select** support — mark several lines and return them all at once
+- **Multi-select** support — mark several items and return them all at once
 - Mouse support — hover highlighting, click a line to select it
 - Debounced filtering + virtualized rendering, so it stays responsive even
   with thousands of piped-in lines
 - Solarized Dark theme out of the box (easily restyled via CSS)
-- D-Bus signal–based architecture — `Show()` returns immediately, so a UI
-  bug can never hang or crash the calling script's D-Bus connection
+- D-Bus signal–based architecture — `Show*()` methods return immediately,
+  so a UI bug can never hang or crash the calling script's D-Bus connection
 - Structured logging via `journal()`, filterable in `journalctl`
 
-## How it works
 
-| Piece | Role |
-|---|---|
-| `extension.js` | Runs inside GNOME Shell. Exports a D-Bus service (`org.gnome.Shell.Extensions.SimpleDmenu`) with a `Show(items)` method, and emits `Selected(items)` / `Cancelled` signals once the user picks something or presses Escape. |
-| `stylesheet.css` | St/Clutter theming — colors, fonts, spacing (Solarized Dark by default). |
-| `cli/gdmenu` | A standalone GJS CLI script, symlinked into your `$PATH` separately from the extension. Reads lines from stdin, calls `Show()` over D-Bus, blocks on a `GLib.MainLoop` until a `Selected`/`Cancelled` signal arrives, then prints the result(s) to stdout — behaving like a normal Unix filter. |
-
-### 2. Install the CLI helper
+## Install the CLI helper
 
 Rather than copying `cli/gdmenu`, symlink it into your `$PATH` so pulling
 future updates with `git pull` automatically updates the command too:
@@ -51,30 +49,52 @@ Make sure `~/.local/bin` is on your `$PATH`
 
 ## Usage
 
-Pipe any newline-separated text into `gdmenu`; the selected line(s) are
-printed to stdout.
-
-```bash
-# Basic selection
-echo -e "reboot\nshutdown\nlock" | gdmenu
+```
+gdmenu [OPTIONS]
 ```
 
+### Modes (choose one)
+
+| Flag | Behavior |
+|---|---|
+| *(none)* | Reads plain text lines from stdin |
+| `--drun` | Shows installed applications (app launcher); selecting one launches it directly |
+| `--window` | Shows currently open windows (window switcher); selecting one focuses it directly |
+| `--paths` | Reads file paths from stdin and displays them with file-type icons |
+
+### Options
+
+| Flag | Effect |
+|---|---|
+| `--multi` | Enable multi-select (default: off) |
+| `--hint TEXT` | Custom hint text shown in the search entry |
+| `--fullscreen` | Make the menu fill the entire screen instead of a centered floating box |
+| `--help`, `-h` | Show usage help |
+
 **Exit codes**: `0` with output on selection, `1` with no output if
-cancelled (Escape) — so `xargs -r` (don't run on empty input) or `&&`
-chaining behaves correctly either way.
+cancelled (Escape) or no input was given; `2` on a connection/D-Bus error —
+so `xargs -r` (don't run on empty input) or `&&` chaining behaves correctly.
+
+Note: `--drun` and `--window` act immediately when you select an item
+(launching the app / focusing the window) *in addition to* printing the
+label to stdout — you don't need to pipe the output anywhere for those two
+modes to be useful on their own.
 
 ## Keyboard shortcuts
 
 | Key | Action |
 |---|---|
-| Type anything | Filter the list (multi-word, order-independent substring match) |
+| Type anything | Filter the list (multi-word, order-independent substring match, matches bolded) |
 | `↓` | Move selection down |
 | `↑` | Move selection up |
 | `Enter` | Confirm — returns the multi-selected items if any are marked, otherwise the currently highlighted line |
-| `Tab` | Toggle the highlighted line into/out of the multi-selection (marked with `●`), then advance to the next line |
-| `Ctrl` + `Space` | Toggle the highlighted line into/out of the multi-selection **without** advancing |
-| `Shift` + `Enter` | Toggle the highlighted line and advance, **without** closing the menu (handy for marking many items in a row) |
+| `Tab` *(multi-select only)* | Toggle the highlighted item into/out of the selection (marked with `●`), then advance to the next item |
+| `Ctrl` + `Space` *(multi-select only)* | Toggle the highlighted item into/out of the selection **without** advancing |
+| `Shift` + `Enter` *(multi-select only)* | Toggle the highlighted item and advance, **without** closing the menu |
 | `Esc` | Cancel — nothing is returned, menu closes |
+
+`Tab`, `Ctrl+Space`, and `Shift+Enter` only do anything when `--multi` was
+passed; without it they're no-ops.
 
 ## Mouse controls
 
@@ -84,12 +104,83 @@ chaining behaves correctly either way.
 | Click a line | Selects and confirms that line immediately (brief green flash before closing) |
 | Click anywhere else in the menu | Refocuses the text entry so you can keep typing |
 
+## Commands to test
+
+### 1. No mode — stdin (plain text)
+
+```bash
+# Basic
+echo -e "Option 1\nOption 2" | gdmenu
+
+# With multi-select and custom hint
+echo -e "Apple\nBanana\nCherry" | gdmenu --multi --hint "Pick fruits"
+
+# With fullscreen and hint
+echo -e "Alpha\nBeta\nGamma" | gdmenu --fullscreen --hint "Select a letter"
+
+# All options together
+echo -e "One\nTwo\nThree" | gdmenu --multi --hint "Choose one or more" --fullscreen
+```
+
+### 2. Application launcher (`--drun`)
+
+```bash
+# Basic app launcher
+gdmenu --drun
+
+# With multi-select
+gdmenu --drun --multi
+
+# With custom hint and fullscreen
+gdmenu --drun --hint "Launch an app" --fullscreen
+
+# All options
+gdmenu --drun --multi --hint "Select apps to run" --fullscreen
+```
+
+### 3. Window switcher (`--window`)
+
+```bash
+# Basic window switcher
+gdmenu --window
+
+# With multi-select
+gdmenu --window --multi
+
+# With custom hint and fullscreen
+gdmenu --window --hint "Switch to window" --fullscreen
+
+# All options
+gdmenu --window --multi --hint "Select windows to focus" --fullscreen
+```
+
+### 4. File paths with icons (`--paths`)
+
+```bash
+# Basic – read from a file
+cat ~/.dotfiles/rofi-bookmarks-list | gdmenu --paths
+
+# With custom hint and fullscreen
+cat ~/.dotfiles/rofi-bookmarks-list | gdmenu --paths --hint "Select a bookmark" --fullscreen
+
+# With multi-select
+cat ~/.dotfiles/rofi-bookmarks-list | gdmenu --paths --multi --hint "Pick one or more" --fullscreen
+
+# All options
+cat ~/.dotfiles/rofi-bookmarks-list | gdmenu --paths --multi --hint "Choose bookmarks" --fullscreen
+```
+
+### 5. Help
+
+```bash
+gdmenu --help
+```
+
 ## Multi-select example
 
 ```bash
-find ~/Projects -maxdepth 1 -type d | gdmenu | xargs -r code
+find . -maxdepth 1 -type d | gdmenu --paths --multi --fullscreen --hint "Select directories" | xargs -r codium
 ```
-
 1. Type to filter down to the projects you want.
 2. Highlight one → press `Tab` (marks it with `●`, jumps to the next line).
 3. Repeat for as many as you like.
@@ -106,14 +197,18 @@ steps.
 
 Edit `stylesheet.css` — it ships with a
 [Solarized Dark](https://ethanschoonover.com/solarized/) palette. Font
-sizes, padding, hover/selected/click-flash colors are all plain CSS on
-`St` widgets, so no JS changes are needed for restyling.
+sizes, padding, hover/selected/click-flash colors, and icon size are all
+plain CSS on `St` widgets, so no JS changes are needed for restyling.
 
 ```bash
 cp stylesheet.css \
   ~/.local/share/gnome-shell/extensions/gnome-dmenu-by-blueray453/stylesheet.css
 # log out / log in to apply
 ```
+
+Note: icon sizing uses St's `icon-size` property rather than `width`/
+`height` — `width`/`height` only sets the layout box and doesn't tell the
+icon theme what resolution to load, which causes blurry upscaled icons.
 
 ### Number of visible results
 
@@ -123,9 +218,9 @@ In `extension.js`:
 const ITEMS_PER_PAGE = 10;
 ```
 
-Rendering is virtualized — only this many `St.Label` rows exist at once
-regardless of how many lines were piped in, so raising this doesn't hurt
-correctness, just adds more on-screen rows.
+Rendering is virtualized — only this many rows exist at once regardless of
+how many items were loaded, so raising this doesn't hurt correctness, just
+adds more on-screen rows.
 
 ### Filter debounce
 

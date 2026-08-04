@@ -312,8 +312,10 @@ const DmenuUI = class {
         this._fullscreen = fullscreen;
         if (hint) {
             this.entry.set_hint_text(hint);
-        } else {
+        } else if (multi) {
             this.entry.set_hint_text('Type to filter · Enter: select · Tab: multi-select · Esc: cancel');
+        } else {
+            this.entry.set_hint_text('Type to filter · Enter: select · Esc: cancel');
         }
         this.entry.set_text('');
         this._selectedIndex = 0;
