@@ -58,22 +58,8 @@ Pipe any newline-separated text into `gdmenu`; the selected line(s) are
 printed to stdout.
 
 ```bash
-# Basic single selection
-echo -e "reboot\nshutdown\nlock" | gdmenu | xargs -I{} systemctl {}
-
-# Pick a project directory to open in an editor
-find ~/Projects -maxdepth 1 -type d | gdmenu | xargs -r code
-
-# Connect to a wifi network
-nmcli -t -f SSID dev wifi | sort -u | gdmenu | xargs -r nmcli dev wifi connect
-
-# Multi-select: open several files at once (one `code` invocation, all args)
-find ~/Notes -name '*.md' | gdmenu | xargs -r code
-
-# Multi-select where you need ONE command run per selected line instead
-find ~/Projects -maxdepth 1 -type d | gdmenu | while read -r dir; do
-    code "$dir"
-done
+# Basic selection
+echo -e "reboot\nshutdown\nlock" | gdmenu
 ```
 
 **Exit codes**: `0` with output on selection, `1` with no output if
