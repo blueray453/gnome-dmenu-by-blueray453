@@ -13,11 +13,8 @@ process itself and uses the compositor's own APIs (`St`, `Clutter`,
 required.
 
 A small CLI helper (`cli/gdmenu`) talks to the extension over D-Bus, so you
-can pipe text into it from shell scripts exactly like classic `dmenu`:
+can pipe text into it from shell scripts exactly like classic `dmenu`
 
-```bash
-echo -e "reboot\nshutdown\nlock" | gdmenu | xargs -I{} systemctl {}
-```
 ## Features
 
 - Full-screen overlay drawn above all other windows, no layer-shell needed
