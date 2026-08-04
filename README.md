@@ -1,5 +1,7 @@
 # gnome-dmenu-by-blueray453
 
+NOTE: This is based on gnome extension and not designed for heavy lifting
+
 A `dmenu`/`rofi`-style application launcher, window switcher, and
 text-selection prompt for **GNOME Shell on Wayland**.
 
@@ -266,3 +268,21 @@ Errors are always logged regardless of this setting, at
 `GLib.LogLevelFlags.LEVEL_CRITICAL`, so they won't be missed even with
 logging disabled.
 
+## ⚠️ Performance & Usage Limits
+
+This extension is **designed for small to medium‑sized lists** (e.g., applications, open windows, a few hundred bookmarks or file paths). It is **not optimized for heavy‑duty scenarios** like:
+
+- Feeding tens of thousands of lines from `find`, `locate`, or `plocate`.
+- Processing massive datasets (e.g., >5 000 items).
+
+**Why?**
+- The extension receives all data via D‑Bus, which has message‑size limits.
+- Filtering is done in‑process (JavaScript) and scans the entire list on every keystroke.
+- Rendering is not virtualised, though only a page is displayed at a time.
+
+**Recommendations for large lists:**
+- Limit the number of items before piping (e.g., `head -n 2000`).
+- Use dedicated launchers like `fzf` that are built for performance.
+- If you need this extension for huge datasets, consider running a local indexer that provides a subset of results.
+
+The extension will **truncate inputs beyond a sensible limit** (e.g., 20 000 items) to prevent freezing your desktop – this is intentional to protect system stability.
