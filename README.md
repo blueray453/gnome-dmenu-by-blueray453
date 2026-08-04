@@ -1,4 +1,4 @@
-## gnome-dmenu-by-blueray453
+# gnome-dmenu-by-blueray453
 
 A `dmenu`/`rofi`-style application launcher and text-selection prompt for
 **GNOME Shell on Wayland**.
@@ -12,13 +12,12 @@ process itself and uses the compositor's own APIs (`St`, `Clutter`,
 `Main.layoutManager.addChrome`) to draw and focus itself, no layer-shell
 required.
 
-A small CLI client (`gdmenu-gjs`) talks to the extension over D-Bus, so you
+A small CLI helper (`cli/gdmenu`) talks to the extension over D-Bus, so you
 can pipe text into it from shell scripts exactly like classic `dmenu`:
 
 ```bash
-echo -e "reboot\nshutdown\nlock" | gdmenu-gjs | xargs -I{} systemctl {}
+echo -e "reboot\nshutdown\nlock" | gdmenu | xargs -I{} systemctl {}
 ```
-
 ## Features
 
 - Full-screen overlay drawn above all other windows, no layer-shell needed
@@ -29,8 +28,9 @@ echo -e "reboot\nshutdown\nlock" | gdmenu-gjs | xargs -I{} systemctl {}
 - Debounced filtering + virtualized rendering, so it stays responsive even
   with thousands of piped-in lines
 - Solarized Dark theme out of the box (easily restyled via CSS)
-- D-Bus signal–based architecture — the `Show` call returns immediately, so
-  a UI bug can never hang or crash the calling script's D-Bus connection
+- D-Bus signal–based architecture — `Show()` returns immediately, so a UI
+  bug can never hang or crash the calling script's D-Bus connection
+- Structured logging via `journal()`, filterable in `journalctl`
 
 ## How it works
 
@@ -38,69 +38,40 @@ echo -e "reboot\nshutdown\nlock" | gdmenu-gjs | xargs -I{} systemctl {}
 |---|---|
 | `extension.js` | Runs inside GNOME Shell. Exports a D-Bus service (`org.gnome.Shell.Extensions.SimpleDmenu`) with a `Show(items)` method, and emits `Selected(items)` / `Cancelled` signals once the user picks something or presses Escape. |
 | `stylesheet.css` | St/Clutter theming — colors, fonts, spacing (Solarized Dark by default). |
-| `gdmenu-gjs` | A standalone GJS CLI script. Reads lines from stdin, calls `Show()` over D-Bus, blocks on a `GLib.MainLoop` until a `Selected`/`Cancelled` signal arrives, then prints the result(s) to stdout — behaving like a normal Unix filter. |
+| `cli/gdmenu` | A standalone GJS CLI script, symlinked into your `$PATH` separately from the extension. Reads lines from stdin, calls `Show()` over D-Bus, blocks on a `GLib.MainLoop` until a `Selected`/`Cancelled` signal arrives, then prints the result(s) to stdout — behaving like a normal Unix filter. |
 
-## Requirements
+### 2. Install the CLI helper
 
-- GNOME Shell 45, 46, or 47 (Wayland or X11)
-- `gjs` (installed by default on any GNOME desktop)
-
-## Installation
-
-### 1. Install the extension
+Rather than copying `cli/gdmenu`, symlink it into your `$PATH` so pulling
+future updates with `git pull` automatically updates the command too:
 
 ```bash
-mkdir -p ~/.local/share/gnome-shell/extensions/simple-dmenu@example.com
-cp metadata.json extension.js stylesheet.css \
-   ~/.local/share/gnome-shell/extensions/simple-dmenu@example.com/
-
-gnome-extensions enable simple-dmenu@example.com
+mkdir -p ~/.local/bin
+chmod +x "$HOME/.local/share/gnome-shell/extensions/gnome-dmenu-by-blueray453/cli/gdmenu"
+ln -sf "$HOME/.local/share/gnome-shell/extensions/gnome-dmenu-by-blueray453/cli/gdmenu" ~/.local/bin/gdmenu
 ```
-
-**Log out and back in.** Wayland sessions cannot hot-reload shell extensions
-the way X11 could with `Alt+F2` → `r` — a full session restart is required
-after installing or editing `extension.js`.
-
-Verify it loaded correctly:
-
-```bash
-gnome-extensions info simple-dmenu@example.com
-```
-
-### 2. Install the CLI client
-
-```bash
-chmod +x gdmenu-gjs
-cp gdmenu-gjs ~/.local/bin/gdmenu-gjs
-```
-
-Make sure `~/.local/bin` is on your `$PATH`:
-
-```bash
-echo $PATH | tr ':' '\n' | grep -q "$HOME/.local/bin" || \
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-```
+Make sure `~/.local/bin` is on your `$PATH`
 
 ## Usage
 
-Pipe any newline-separated text into `gdmenu-gjs`; the selected line(s) are
+Pipe any newline-separated text into `gdmenu`; the selected line(s) are
 printed to stdout.
 
 ```bash
 # Basic single selection
-echo -e "reboot\nshutdown\nlock" | gdmenu-gjs | xargs -I{} systemctl {}
+echo -e "reboot\nshutdown\nlock" | gdmenu | xargs -I{} systemctl {}
 
 # Pick a project directory to open in an editor
-find ~/Projects -maxdepth 1 -type d | gdmenu-gjs | xargs -r code
+find ~/Projects -maxdepth 1 -type d | gdmenu | xargs -r code
 
 # Connect to a wifi network
-nmcli -t -f SSID dev wifi | sort -u | gdmenu-gjs | xargs -r nmcli dev wifi connect
+nmcli -t -f SSID dev wifi | sort -u | gdmenu | xargs -r nmcli dev wifi connect
 
 # Multi-select: open several files at once (one `code` invocation, all args)
-find ~/Notes -name '*.md' | gdmenu-gjs | xargs -r code
+find ~/Notes -name '*.md' | gdmenu | xargs -r code
 
 # Multi-select where you need ONE command run per selected line instead
-find ~/Projects -maxdepth 1 -type d | gdmenu-gjs | while read -r dir; do
+find ~/Projects -maxdepth 1 -type d | gdmenu | while read -r dir; do
     code "$dir"
 done
 ```
@@ -109,25 +80,31 @@ done
 cancelled (Escape) — so `xargs -r` (don't run on empty input) or `&&`
 chaining behaves correctly either way.
 
-## Keybindings
+## Keyboard shortcuts
 
 | Key | Action |
 |---|---|
 | Type anything | Filter the list (multi-word, order-independent substring match) |
-| `↓` / `↑` | Move selection down / up |
+| `↓` | Move selection down |
+| `↑` | Move selection up |
 | `Enter` | Confirm — returns the multi-selected items if any are marked, otherwise the currently highlighted line |
 | `Tab` | Toggle the highlighted line into/out of the multi-selection (marked with `●`), then advance to the next line |
 | `Ctrl` + `Space` | Toggle the highlighted line into/out of the multi-selection **without** advancing |
 | `Shift` + `Enter` | Toggle the highlighted line and advance, **without** closing the menu (handy for marking many items in a row) |
 | `Esc` | Cancel — nothing is returned, menu closes |
-| Mouse hover over a line | Highlights it |
-| Mouse click on a line | Selects and confirms that line immediately (brief green flash before closing) |
+
+## Mouse controls
+
+| Action | Result |
+|---|---|
+| Hover over a line | Highlights it |
+| Click a line | Selects and confirms that line immediately (brief green flash before closing) |
 | Click anywhere else in the menu | Refocuses the text entry so you can keep typing |
 
 ## Multi-select example
 
 ```bash
-find ~/Projects -maxdepth 1 -type d | gdmenu-gjs | xargs -r code
+find ~/Projects -maxdepth 1 -type d | gdmenu | xargs -r code
 ```
 
 1. Type to filter down to the projects you want.
@@ -144,13 +121,14 @@ steps.
 
 ### Theme
 
-Edit `stylesheet.css` in the extension folder — it ships with a
+Edit `stylesheet.css` — it ships with a
 [Solarized Dark](https://ethanschoonover.com/solarized/) palette. Font
-sizes, padding, hover/selected/click-flash colors are all plain CSS custom
-properties on `St` widgets, so no JS changes are needed for restyling.
+sizes, padding, hover/selected/click-flash colors are all plain CSS on
+`St` widgets, so no JS changes are needed for restyling.
 
 ```bash
-cp stylesheet.css ~/.local/share/gnome-shell/extensions/simple-dmenu@example.com/stylesheet.css
+cp stylesheet.css \
+  ~/.local/share/gnome-shell/extensions/gnome-dmenu-by-blueray453/stylesheet.css
 # log out / log in to apply
 ```
 
@@ -177,33 +155,48 @@ piping in very large lists (thousands of lines) and typing feels janky.
 
 ### D-Bus name / object path
 
-If you want to avoid any naming collision with other extensions, change:
+To avoid any naming collision with other extensions, change these
+constants in both `extension.js` and `cli/gdmenu` (they must match
+exactly in both files):
 
 ```js
 const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
-const INTERFACE_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 ```
-
-in both `extension.js` and `gdmenu-gjs`, and update `metadata.json`'s
-`uuid` accordingly.
 
 ## Debugging
 
-Watch GNOME Shell's logs while testing:
+Logging is structured via `journal()` in `utils.js` and tagged with
+`SYSLOG_IDENTIFIER=gnome-dmenu-by-blueray453`, so you can filter cleanly
+instead of scrolling through all of GNOME Shell's log noise:
 
 ```bash
-journalctl -f -o cat /usr/bin/gnome-shell
+journalctl -f -o cat SYSLOG_IDENTIFIER=gnome-dmenu-by-blueray453
 ```
+
+Trigger the extension (run `gdmenu` in another terminal) while this is
+running to see live output.
+
+Logging is enabled by default (`setLogging(true)` in `enable()`). To
+silence non-error messages, set it to `false`:
+
+```js
+setLogging(false);
+```
+
+Errors are always logged regardless of this setting, at
+`GLib.LogLevelFlags.LEVEL_CRITICAL`, so they won't be missed even with
+logging disabled.
 
 Common issues:
 
 | Symptom | Likely cause |
 |---|---|
-| `gdmenu: could not reach extension` | Extension isn't enabled, or you haven't logged out/in since installing — check `gnome-extensions info simple-dmenu@example.com` |
-| Call hangs indefinitely | A JS exception was thrown inside the extension before it could emit a signal — check `journalctl` for a stack trace |
+| `gdmenu: could not reach extension` | Extension isn't enabled, or you haven't logged out/in since installing — check `gnome-extensions info gnome-dmenu-by-blueray453` |
+| Call hangs indefinitely | A JS exception was thrown inside the extension before it could emit a signal — check `journalctl -f -o cat SYSLOG_IDENTIFIER=gnome-dmenu-by-blueray453` for details |
 | Typed text doesn't appear / no focus | Extension didn't grab entry focus in time — try clicking inside the box once as a workaround, then file an issue |
 | Menu doesn't reflect `extension.js` edits | Wayland requires a full logout/login to reload shell extension code — there is no in-place reload like X11's `Alt+F2` → `r` |
+| `gdmenu: command not found` | Symlink wasn't created, or `~/.local/bin` isn't on `$PATH` — see Installation step 2 |
 
 ## Architecture notes / why it's built this way
 
