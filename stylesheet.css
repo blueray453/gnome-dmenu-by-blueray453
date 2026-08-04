@@ -1,4 +1,4 @@
-.dmenu-box {
+.dmenu-container {
     background-color: rgba(30, 30, 30, 0.95);
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 16px;
@@ -14,8 +14,19 @@
     color: #ffffff;
 }
 
-.dmenu-results {
+.dmenu-results-container {
     spacing: 6px;
+}
+
+.dmenu-result-row {
+    spacing: 8px;
+}
+
+.dmenu-marker {
+    font-size: 30px;
+    color: #5dade2;
+    width: 32px;          /* fixed column so text doesn't shift left/right on toggle */
+    text-align: center;
 }
 
 .dmenu-result {

@@ -1,227 +1,347 @@
-import GObject from 'gi://GObject';
-import St from 'gi://St';
-import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import St from 'gi://St';
+import Clutter from 'gi://Clutter';
 
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const DMenuIface = `
+const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
+const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
+const INTERFACE_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
+
+const DBUS_INTERFACE = `
 <node>
   <interface name="org.gnome.Shell.Extensions.SimpleDmenu">
-    <method name="Prompt">
-      <arg type="as" direction="in" name="lines"/>
-      <arg type="s" direction="out" name="selection"/>
+    <method name="Show">
+      <arg type="as" name="items" direction="in"/>
     </method>
+    <signal name="Selected">
+      <arg type="as" name="items"/>
+    </signal>
+    <signal name="Cancelled"/>
   </interface>
 </node>`;
 
-const MAX_VISIBLE = 10;
+const ITEMS_PER_PAGE = 10;
+const FILTER_DEBOUNCE_MS = 150;
 
-const DMenu = GObject.registerClass(
-    {
-        Signals: {
-            'selected': { param_types: [GObject.TYPE_STRING] },
-            'cancelled': {},
-        },
-    },
-    class DMenu extends St.BoxLayout {
-        _init(lines) {
-            super._init({
-                vertical: true,
-                style_class: 'dmenu-box',
-                reactive: true,
-                can_focus: true,
-            });
-
-            this._allLines = lines;
-            this._filtered = lines.slice(0, MAX_VISIBLE);
-            this._selectedIndex = 0;
-
-            this._entry = new St.Entry({
-                style_class: 'dmenu-entry',
-                hint_text: 'Type to filter, Enter to select, Esc to cancel',
-                can_focus: true,
-            });
-            this.add_child(this._entry);
-
-            this._resultsBox = new St.BoxLayout({ vertical: true, style_class: 'dmenu-results' });
-            this.add_child(this._resultsBox);
-
-            this._entry.clutter_text.connect('text-changed', () => {
-                this._filterLines(this._entry.get_text());
-            });
-            this._entry.clutter_text.connect('key-press-event', this._onKeyPress.bind(this));
-
-            this._render();
-        }
-
-        focusEntry() {
-            this._entry.grab_key_focus();
-        }
-
-        _filterLines(query) {
-            const q = query.toLowerCase();
-            this._filtered = q
-                ? this._allLines.filter(l => l.toLowerCase().includes(q)).slice(0, MAX_VISIBLE)
-                : this._allLines.slice(0, MAX_VISIBLE);
-            this._selectedIndex = 0;
-            this._render();
-        }
-
-        _render() {
-            this._resultsBox.destroy_all_children();
-            this._filtered.forEach((line, i) => {
-                const label = new St.Label({
-                    text: line,
-                    style_class: i === this._selectedIndex
-                        ? 'dmenu-result dmenu-result-selected'
-                        : 'dmenu-result',
-                });
-                this._resultsBox.add_child(label);
-            });
-        }
-
-        _onKeyPress(actor, event) {
-            const sym = event.get_key_symbol();
-
-            if (sym === Clutter.KEY_Escape) {
-                this.emit('cancelled');
-                return Clutter.EVENT_STOP;
-            }
-
-            if (sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) {
-                const choice = this._filtered.length > 0
-                    ? this._filtered[this._selectedIndex]
-                    : this._entry.get_text();
-                if (choice)
-                    this.emit('selected', choice);
-                else
-                    this.emit('cancelled');
-                return Clutter.EVENT_STOP;
-            }
-
-            if (sym === Clutter.KEY_Down) {
-                if (this._filtered.length > 0) {
-                    this._selectedIndex = (this._selectedIndex + 1) % this._filtered.length;
-                    this._render();
-                }
-                return Clutter.EVENT_STOP;
-            }
-
-            if (sym === Clutter.KEY_Up) {
-                if (this._filtered.length > 0) {
-                    this._selectedIndex =
-                        (this._selectedIndex - 1 + this._filtered.length) % this._filtered.length;
-                    this._render();
-                }
-                return Clutter.EVENT_STOP;
-            }
-
-            if (sym === Clutter.KEY_Tab) {
-                if (this._filtered.length > 0) {
-                    this._entry.set_text(this._filtered[this._selectedIndex]);
-                    this._entry.clutter_text.set_cursor_position(-1);
-                }
-                return Clutter.EVENT_STOP;
-            }
-
-            return Clutter.EVENT_PROPAGATE;
-        }
-    });
-
-class DMenuDBusService {
+class DmenuService {
     constructor(extension) {
         this._extension = extension;
-        this._impl = Gio.DBusExportedObject.wrapJSObject(DMenuIface, this);
-        this._impl.export(Gio.DBus.session, '/org/gnome/Shell/Extensions/SimpleDmenu');
+        this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_INTERFACE, this);
     }
 
-    PromptAsync(params, invocation) {
-        const [lines] = params;
-        try {
-            this._extension.openPrompt(lines, (selection) => {
-                try {
-                    invocation.return_value(new GLib.Variant('(s)', [selection ?? '']));
-                } catch (e) {
-                    logError(e, 'SimpleDmenu: failed to return D-Bus value');
-                }
-            });
-        } catch (e) {
-            logError(e, 'SimpleDmenu: openPrompt threw');
-            invocation.return_error_literal(
-                Gio.DBusError, Gio.DBusError.FAILED, `SimpleDmenu error: ${e}`);
+    Show(items) {
+        this._extension.show(items);
+    }
+
+    emitSelected(items) {
+        this._dbusImpl.emit_signal('Selected', GLib.Variant.new('(as)', [items]));
+    }
+
+    emitCancelled() {
+        this._dbusImpl.emit_signal('Cancelled', null);
+    }
+
+    export() {
+        this._dbusImpl.export(Gio.DBus.session, OBJECT_PATH);
+        this._ownerId = Gio.DBus.session.own_name(
+            BUS_NAME, Gio.BusNameOwnerFlags.NONE, null, null);
+    }
+
+    unexport() {
+        this._dbusImpl.unexport();
+        if (this._ownerId) {
+            Gio.DBus.session.unown_name(this._ownerId);
+            this._ownerId = null;
         }
-    }
-
-    destroy() {
-        this._impl.unexport();
     }
 }
 
-export default class SimpleDmenuExtension extends Extension {
-    enable() {
-        this._menu = null;
-        this._grab = null;
-        this._pendingCallback = null;
-        this._service = new DMenuDBusService(this);
+const DmenuUI = class {
+    constructor(service) {
+        this._service = service;
+
+        this.actor = new St.BoxLayout({
+            style_class: 'dmenu-container',
+            vertical: true,
+            reactive: true,
+            can_focus: true,
+        });
+
+        this.entry = new St.Entry({
+            style_class: 'dmenu-entry',
+            hint_text: 'Type to filter · Enter: select · Tab: multi-select · Esc: cancel',
+            can_focus: true,
+            x_expand: true,
+        });
+
+        this.results_container = new St.ScrollView({
+            style_class: 'dmenu-results-container',
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            x_expand: true,
+            y_expand: true,
+        });
+        this.results_box = new St.BoxLayout({ style_class: 'dmenu-results-box', vertical: true });
+        this.results_container.set_child(this.results_box);
+
+        this.actor.add_child(this.entry);
+        this.actor.add_child(this.results_container);
+
+        const clutterText = this.entry.get_clutter_text();
+        clutterText.connect('text-changed', this._onTextChanged.bind(this));
+
+        // Return is consumed internally by ClutterText's 'activate' signal
+        // before it would ever reach a key-press-event handler on a parent
+        // actor — so Enter MUST be handled here, not in _onKeyPress below.
+        clutterText.connect('activate', this._activate.bind(this));
+
+        // Navigation keys (Up/Down/Tab/Escape/Ctrl+Space) are not consumed
+        // by ClutterText in a single-line entry, so these bubble fine.
+        this.actor.connect('key-press-event', this._onKeyPress.bind(this));
+
+        this._allItems = [];
+        this._visibleItems = [];
+        this._selectedIndex = 0;
+        this._scrollStart = 0;
+        this._selectedItems = new Set();
+        this._filterTimeoutId = null;
+        this._isOpen = false;
     }
 
-    openPrompt(lines, onSelect) {
-        if (this._menu)
-            this._closeMenu(null);
+    show(items) {
+        if (this._isOpen)
+            this._closeInternal();
 
-        this._pendingCallback = onSelect;
-        this._menu = new DMenu(lines);
-
-        this._menu.connect('selected', (_actor, text) => this._closeMenu(text));
-        this._menu.connect('cancelled', () => this._closeMenu(null));
-
-        Main.layoutManager.addChrome(this._menu, { affectsInputRegion: true });
+        this._allItems = items;
+        this.entry.set_text('');
+        this._selectedIndex = 0;
+        this._scrollStart = 0;
+        this._selectedItems.clear();
+        this._isOpen = true;
 
         const monitor = Main.layoutManager.primaryMonitor;
-        this._menu.set_width(Math.min(700, monitor.width - 100));
-        this._menu.set_position(
-            monitor.x + Math.floor((monitor.width - this._menu.width) / 2),
-            monitor.y + Math.floor(monitor.height / 4)
+        this.actor.set_width(Math.min(1000, monitor.width - 100));
+        this.actor.set_height(Math.min(600, monitor.height - 150));
+        this.actor.set_position(
+            monitor.x + Math.floor((monitor.width - this.actor.width) / 2),
+            monitor.y + Math.floor(monitor.height / 6)
         );
 
-        // IMPORTANT: pushModal returns a grab handle on modern GNOME Shell.
-        // That handle — not the actor — must be passed to popModal later.
-        this._grab = Main.pushModal(this._menu);
+        Main.layoutManager.addChrome(this.actor, { affectsInputRegion: true });
 
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-            this._menu?.focusEntry();
+            if (this._isOpen)
+                this.entry.grab_key_focus();
+            return GLib.SOURCE_REMOVE;
+        });
+
+        this._updateResults();
+    }
+
+    hide() {
+        this._closeInternal();
+    }
+
+    _closeInternal() {
+        if (!this._isOpen)
+            return;
+        if (this._filterTimeoutId) {
+            GLib.source_remove(this._filterTimeoutId);
+            this._filterTimeoutId = null;
+        }
+        Main.layoutManager.removeChrome(this.actor);
+        this._isOpen = false;
+    }
+
+    _onTextChanged() {
+        if (this._filterTimeoutId)
+            GLib.source_remove(this._filterTimeoutId);
+
+        this._filterTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FILTER_DEBOUNCE_MS, () => {
+            this._selectedIndex = 0;
+            this._scrollStart = 0;
+            this._updateResults();
+            this._filterTimeoutId = null;
             return GLib.SOURCE_REMOVE;
         });
     }
 
-    _closeMenu(result) {
-        if (!this._menu)
-            return;
+    _onKeyPress(actor, event) {
+        const sym = event.get_key_symbol();
+        const mods = event.get_state();
 
-        try {
-            if (this._grab) {
-                Main.popModal(this._grab);
-                this._grab = null;
-            }
-            Main.layoutManager.removeChrome(this._menu);
-            this._menu.destroy();
-        } catch (e) {
-            logError(e, 'SimpleDmenu: error while closing menu');
+        if (sym === Clutter.KEY_Escape) {
+            this._service.emitCancelled();
+            this.hide();
+            return Clutter.EVENT_STOP;
         }
-        this._menu = null;
 
-        const cb = this._pendingCallback;
-        this._pendingCallback = null;
-        if (cb)
-            cb(result);
+        if (sym === Clutter.KEY_Down) {
+            if (this._visibleItems.length > 0) {
+                this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
+                this._updateScrollWindow();
+                this._render();
+            }
+            return Clutter.EVENT_STOP;
+        }
+
+        if (sym === Clutter.KEY_Up) {
+            if (this._visibleItems.length > 0) {
+                this._selectedIndex = Math.max(0, this._selectedIndex - 1);
+                this._updateScrollWindow();
+                this._render();
+            }
+            return Clutter.EVENT_STOP;
+        }
+
+        // Tab: toggle current item into the multi-selection set, advance to next
+        if (sym === Clutter.KEY_Tab) {
+            this._toggleCurrent();
+            if (this._visibleItems.length > 0)
+                this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
+            this._updateScrollWindow();
+            this._render();
+            return Clutter.EVENT_STOP;
+        }
+
+        // Ctrl+Space: toggle current item without advancing
+        if (sym === Clutter.KEY_space && (mods & Clutter.ModifierType.CONTROL_MASK)) {
+            this._toggleCurrent();
+            this._render();
+            return Clutter.EVENT_STOP;
+        }
+
+        // Shift+Return: toggle current item and advance, without closing the menu
+        if ((sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) &&
+            (mods & Clutter.ModifierType.SHIFT_MASK)) {
+            this._toggleCurrent();
+            if (this._visibleItems.length > 0)
+                this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
+            this._updateScrollWindow();
+            this._render();
+            return Clutter.EVENT_STOP;
+        }
+
+        return Clutter.EVENT_PROPAGATE;
+    }
+
+    _toggleCurrent() {
+        if (this._visibleItems.length === 0 || this._selectedIndex >= this._visibleItems.length)
+            return;
+        const item = this._visibleItems[this._selectedIndex];
+        if (this._selectedItems.has(item))
+            this._selectedItems.delete(item);
+        else
+            this._selectedItems.add(item);
+    }
+
+    // Plain Enter: return the multi-selection if any items were toggled,
+    // otherwise just the currently highlighted line.
+    _activate() {
+        let result = [];
+
+        if (this._selectedItems.size > 0) {
+            result = Array.from(this._selectedItems);
+        } else if (this._visibleItems.length > 0 && this._selectedIndex < this._visibleItems.length) {
+            result = [this._visibleItems[this._selectedIndex]];
+        } else if (this.entry.get_text()) {
+            result = [this.entry.get_text()];
+        }
+
+        if (result.length > 0)
+            this._service.emitSelected(result);
+        else
+            this._service.emitCancelled();
+
+        this.hide();
+    }
+
+    _updateResults() {
+        const filter = this.entry.get_text().trim().toLowerCase();
+        const tokens = filter.split(/\s+/).filter(t => t.length > 0);
+
+        this._visibleItems = tokens.length === 0
+            ? this._allItems
+            : this._allItems.filter(item => {
+                const lower = item.toLowerCase();
+                return tokens.every(tok => lower.includes(tok));
+            });
+
+        this._updateScrollWindow();
+        this._render();
+    }
+
+    _updateScrollWindow() {
+        if (this._visibleItems.length === 0) {
+            this._scrollStart = 0;
+            return;
+        }
+        const buffer = Math.floor(ITEMS_PER_PAGE / 4);
+
+        if (this._selectedIndex < this._scrollStart + buffer) {
+            this._scrollStart = Math.max(0, this._selectedIndex - buffer);
+        } else if (this._selectedIndex >= this._scrollStart + ITEMS_PER_PAGE - buffer) {
+            this._scrollStart = Math.min(
+                Math.max(0, this._visibleItems.length - ITEMS_PER_PAGE),
+                this._selectedIndex - ITEMS_PER_PAGE + buffer + 1
+            );
+        }
+        this._scrollStart = Math.max(0, this._scrollStart);
+    }
+
+    _render() {
+        this.results_box.remove_all_children();
+
+        const end = Math.min(this._scrollStart + ITEMS_PER_PAGE, this._visibleItems.length);
+        for (let i = this._scrollStart; i < end; i++) {
+            const item = this._visibleItems[i];
+            const row = new St.BoxLayout({
+                vertical: false,
+                style_class: 'dmenu-result-row',
+                x_expand: true,
+            });
+
+            const marker = new St.Label({
+                text: this._selectedItems.has(item) ? '●' : '',
+                style_class: 'dmenu-marker',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            const label = new St.Label({
+                text: item,
+                style_class: i === this._selectedIndex
+                    ? 'dmenu-result dmenu-result-selected'
+                    : 'dmenu-result',
+                x_expand: true,
+                x_align: Clutter.ActorAlign.FILL,   // <-- this is the missing piece
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            row.add_child(marker);
+            row.add_child(label);
+            this.results_box.add_child(row);
+        }
+    }
+};
+
+export default class SimpleDmenuExtension extends Extension {
+    enable() {
+        this._service = new DmenuService(this);
+        this._service.export();
+        this._ui = new DmenuUI(this._service);
     }
 
     disable() {
-        this._closeMenu(null);
-        this._service?.destroy();
+        this._ui?.hide();
+        this._ui = null;
+        this._service?.unexport();
         this._service = null;
+    }
+
+    show(items) {
+        this._ui.show(items);
     }
 }
