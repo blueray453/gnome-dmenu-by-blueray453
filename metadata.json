@@ -1,8 +1,8 @@
 {
-    "uuid": "gnome-extension-dmenu",
-    "name": "gnome-extension-dmenu",
+    "uuid": "gnome-dmenu-by-blueray453",
+    "name": "gnome-dmenu-by-blueray453",
     "description": "Provides a dmenu-like interface that can be used for scripting. Listens on DBus for requests.",
     "shell-version": ["45", "46", "47", "48"],
-    "url": "https://github.com/blueray453/gnome-extension-dmenu",
+    "url": "https://github.com/blueray453/gnome-dmenu-by-blueray453",
     "version": 1
 }
