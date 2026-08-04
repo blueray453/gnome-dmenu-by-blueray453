@@ -1,85 +1,31 @@
-/*
- * stylesheet.css
- *
- * CSS for the dmenu-gnome GNOME Shell Extension.
- *
- * Author: Rasmus Steinke
- */
-
-.dmenu-container {
-    background-color: rgba(34, 34, 34, 0.95);
-    border: none;
-    border-radius: 0px;
-    box-shadow: none;
-    padding: 20px;
-}
-
-.dmenu-top-bar {
-    padding: 8px;
-    spacing: 8px;
-}
-
-.dmenu-prompt {
-    color: #888888;
-    font-weight: bold;
-    font-family: monospace !important;
+.dmenu-box {
+    background-color: rgba(30, 30, 30, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 16px;
+    padding: 24px;
+    spacing: 14px;
 }
 
 .dmenu-entry {
-    font-size: 1.2em;
-    color: #eeeeee;
-    background-color: rgba(0, 0, 0, 0.2);
-    border: 1px solid #444444;
-    border-radius: 4px;
-    caret-color: #eeeeee;
-    caret-size: 2px;
-    padding: 8px;
-    selection-background-color: #5294e2; /* Standard GNOME selection color */
-    font-family: monospace !important;
+    font-size: 36px;
+    padding: 18px 16px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #ffffff;
 }
 
-.dmenu-entry:focus {
-    border-color: #5294e2;
-    background-color: rgba(0, 0, 0, 0.3);
+.dmenu-results {
+    spacing: 6px;
 }
 
-.dmenu-results-container {
-    padding: 0 8px 8px 8px;
-}
-
-.dmenu-results-box {
-    spacing: 4px;
-}
-
-.dmenu-result-item {
-    padding: 10px 12px;
+.dmenu-result {
+    font-size: 30px;
+    padding: 14px 16px;
     color: #cccccc;
-    font-size: 1.0em;
-    border-radius: 4px;
-    transition: background-color 0.1s ease;
-    margin: 1px 0;
-    font-family: monospace !important;
+    border-radius: 8px;
 }
 
-.dmenu-result-item:hover {
-    background-color: rgba(82, 148, 226, 0.3);
-}
-
-.dmenu-result-item.selected {
-    background-color: #5294e2; /* Standard GNOME selection color */
+.dmenu-result-selected {
+    background-color: rgba(53, 132, 228, 0.5);
     color: #ffffff;
-    font-weight: bold;
-}
-
-.dmenu-result-item.multi-selected {
-    background-color: rgba(82, 148, 226, 0.4); /* Semi-transparent selection */
-    color: #ffffff;
-    border-left: 3px solid #5294e2;
-}
-
-.dmenu-selection-indicator {
-    color: #5294e2;
-    font-weight: bold;
-    font-family: monospace !important;
-    padding-right: 8px;
 }
