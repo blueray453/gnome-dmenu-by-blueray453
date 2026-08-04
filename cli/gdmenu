@@ -1,0 +1,111 @@
+#!/usr/bin/env gjs
+
+imports.gi.versions.Gio = '2.0';
+const {Gio, GLib} = imports.gi;
+const System = imports.system;
+
+let GioUnix;
+try { GioUnix = imports.gi.GioUnix; } catch (e) { GioUnix = null; }
+
+const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
+const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
+const INTERFACE_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
+
+function readStdinLines() {
+    const unixStream = GioUnix
+        ? new GioUnix.InputStream({fd: 0, close_fd: false})
+        : new Gio.UnixInputStream({fd: 0, close_fd: false});
+    const dataStream = new Gio.DataInputStream({base_stream: unixStream});
+
+    const lines = [];
+    while (true) {
+        const [line] = dataStream.read_line_utf8(null);
+        if (line === null)
+            break;
+        if (line.length > 0)
+            lines.push(line);
+    }
+    return lines;
+}
+
+function main() {
+    const lines = readStdinLines();
+    if (lines.length === 0)
+        System.exit(1);
+
+    const loop = GLib.MainLoop.new(null, false);
+    let result = null;
+
+    let bus;
+    try {
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, null);
+    } catch (e) {
+        printerr(`gdmenu: could not connect to session bus: ${e.message}`);
+        System.exit(2);
+    }
+
+    // Subscribe to both outcomes BEFORE calling Show(), so we can't
+    // miss a signal that fires while we're still setting up.
+    bus.signal_subscribe(
+        null, INTERFACE_NAME, 'Selected', OBJECT_PATH, null,
+        Gio.DBusSignalFlags.NONE,
+        (conn, sender, path, iface, signal, params) => {
+            // Selected now carries an array of strings (multi-select support).
+            result = params.deepUnpack()[0];
+            loop.quit();
+        }
+    );
+
+    bus.signal_subscribe(
+        null, INTERFACE_NAME, 'Cancelled', OBJECT_PATH, null,
+        Gio.DBusSignalFlags.NONE,
+        () => {
+            result = null;
+            loop.quit();
+        }
+    );
+
+    let proxy;
+    try {
+        proxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION,
+            Gio.DBusProxyFlags.NONE,
+            null,
+            BUS_NAME,
+            OBJECT_PATH,
+            INTERFACE_NAME,
+            null
+        );
+    } catch (e) {
+        printerr(`gdmenu: could not reach extension: ${e.message}`);
+        printerr('gdmenu: is the simple-dmenu GNOME Shell extension enabled?');
+        System.exit(2);
+    }
+
+    try {
+        // Fire-and-forget: Show() returns immediately, the real result
+        // comes back later via the Selected/Cancelled signal above.
+        proxy.call_sync(
+            'Show',
+            new GLib.Variant('(as)', [lines]),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            null
+        );
+    } catch (e) {
+        printerr(`gdmenu: Show() call failed: ${e.message}`);
+        System.exit(2);
+    }
+
+    loop.run();
+
+    if (result && result.length > 0) {
+        for (const item of result)
+            print(item);
+        System.exit(0);
+    } else {
+        System.exit(1);
+    }
+}
+
+main();

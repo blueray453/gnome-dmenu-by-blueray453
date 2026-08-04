@@ -6,9 +6,10 @@ import Clutter from 'gi://Clutter';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+import { setLogging, setLogFn, journal } from './utils.js'
+
 const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
-const INTERFACE_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 
 const DBUS_INTERFACE = `
 <node>
@@ -376,6 +377,30 @@ const DmenuUI = class {
 
 export default class SimpleDmenuExtension extends Extension {
     enable() {
+        setLogFn((msg, error = false) => {
+            let level;
+            if (error) {
+                level = GLib.LogLevelFlags.LEVEL_CRITICAL;
+            } else {
+                level = GLib.LogLevelFlags.LEVEL_MESSAGE;
+            }
+
+            GLib.log_structured(
+                'gnome-dmenu-by-blueray453',
+                level,
+                {
+                    MESSAGE: `${msg}`,
+                    SYSLOG_IDENTIFIER: 'gnome-dmenu-by-blueray453',
+                    CODE_FILE: GLib.filename_from_uri(import.meta.url)[0]
+                }
+            );
+        });
+
+        setLogging(true);
+
+        // journalctl -f -o cat SYSLOG_IDENTIFIER=gnome-dmenu-by-blueray453
+        journal(`Enabled`);
+
         this._service = new DmenuService(this);
         this._service.export();
         this._ui = new DmenuUI(this._service);
