@@ -16,16 +16,27 @@ const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
 const DBUS_INTERFACE = `
 <node>
   <interface name="org.gnome.Shell.Extensions.SimpleDmenu">
-    <!-- Original: simple list of strings from stdin, now with multi flag -->
     <method name="Show">
       <arg type="as" name="items" direction="in"/>
       <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
     </method>
     <method name="ShowApps">
       <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
     </method>
     <method name="ShowWindows">
       <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
+    </method>
+    <method name="ShowPaths">
+      <arg type="as" name="paths" direction="in"/>
+      <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
     </method>
     <signal name="Selected">
       <arg type="as" name="items"/>
@@ -43,17 +54,20 @@ class DmenuService {
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_INTERFACE, this);
     }
 
-    // Now accepts a multi flag
-    Show(items, multi) {
-        this._extension.show(items, multi);
+    Show(items, multi, hint, fullscreen) {
+        this._extension.show(items, multi, hint, fullscreen);
     }
 
-    ShowApps(multi) {
-        this._extension.showApps(multi);
+    ShowApps(multi, hint, fullscreen) {
+        this._extension.showApps(multi, hint, fullscreen);
     }
 
-    ShowWindows(multi) {
-        this._extension.showWindows(multi);
+    ShowWindows(multi, hint, fullscreen) {
+        this._extension.showWindows(multi, hint, fullscreen);
+    }
+
+    ShowPaths(paths, multi, hint, fullscreen) {
+        this._extension.showPaths(paths, multi, hint, fullscreen);
     }
 
     emitSelected(items) {
@@ -77,6 +91,54 @@ class DmenuService {
             this._ownerId = null;
         }
     }
+}
+
+/**
+ * Generate Pango markup with <b> tags around each occurrence of tokens in label.
+ * Tokens are matched case‑insensitively.
+ */
+function highlightLabel(label, tokens) {
+    if (!tokens || tokens.length === 0) {
+        return GLib.markup_escape_text(label, -1);
+    }
+    const escaped = GLib.markup_escape_text(label, -1);
+    const lowerLabel = label.toLowerCase();
+    const intervals = [];
+    for (const token of tokens) {
+        const lowerToken = token.toLowerCase();
+        let idx = lowerLabel.indexOf(lowerToken);
+        while (idx !== -1) {
+            intervals.push({ start: idx, end: idx + lowerToken.length });
+            idx = lowerLabel.indexOf(lowerToken, idx + 1);
+        }
+    }
+    if (intervals.length === 0) return escaped;
+
+    intervals.sort((a, b) => a.start - b.start);
+    const merged = [intervals[0]];
+    for (let i = 1; i < intervals.length; i++) {
+        const last = merged[merged.length - 1];
+        const cur = intervals[i];
+        if (cur.start <= last.end) {
+            last.end = Math.max(last.end, cur.end);
+        } else {
+            merged.push(cur);
+        }
+    }
+
+    let markup = '';
+    let pos = 0;
+    for (const interval of merged) {
+        if (interval.start > pos) {
+            markup += escaped.substring(pos, interval.start);
+        }
+        markup += '<b>' + escaped.substring(interval.start, interval.end) + '</b>';
+        pos = interval.end;
+    }
+    if (pos < escaped.length) {
+        markup += escaped.substring(pos);
+    }
+    return markup;
 }
 
 const DmenuUI = class {
@@ -125,21 +187,22 @@ const DmenuUI = class {
             return Clutter.EVENT_STOP;
         });
 
-        // Internal state
-        this._allItems = [];          // each: { label, icon, data, id }
+        this._allItems = [];
         this._visibleItems = [];
         this._selectedIndex = 0;
         this._scrollStart = 0;
-        this._selectedItems = new Set(); // stores ID strings
+        this._selectedItems = new Set();
         this._filterTimeoutId = null;
         this._isOpen = false;
         this._multiSelectEnabled = false;
-        this._actionMode = 'stdin';   // 'stdin', 'drun', 'window'
+        this._fullscreen = false;
+        this._actionMode = 'stdin';
+        this._filterTokens = [];
     }
 
     // ---------- Public API ----------
 
-    show(items, multi = false) {
+    show(items, multi = false, hint = null, fullscreen = false) {
         const idMap = new Map();
         const itemObjects = items.map((item, index) => {
             let label, id;
@@ -162,10 +225,10 @@ const DmenuUI = class {
             };
         });
         this._actionMode = 'stdin';
-        this._showItems(itemObjects, multi);
+        this._showItems(itemObjects, multi, hint, fullscreen);
     }
 
-    showApps(multi) {
+    showApps(multi = false, hint = null, fullscreen = false) {
         let appSystem = Shell.AppSystem.get_default();
         let apps = [];
         if (appSystem && typeof appSystem.get_all === 'function') {
@@ -181,10 +244,10 @@ const DmenuUI = class {
             id: a.get_id(),
         }));
         this._actionMode = 'drun';
-        this._showItems(items, multi);
+        this._showItems(items, multi, hint, fullscreen);
     }
 
-    showWindows(multi) {
+    showWindows(multi = false, hint = null, fullscreen = false) {
         const windows = global.display.get_tab_list(Meta.TabList.NORMAL, null);
         let tracker = null;
         if (typeof Shell.WindowTracker.get_default === 'function') {
@@ -205,7 +268,34 @@ const DmenuUI = class {
             };
         });
         this._actionMode = 'window';
-        this._showItems(items, multi);
+        this._showItems(items, multi, hint, fullscreen);
+    }
+
+    showPaths(paths, multi = false, hint = null, fullscreen = false) {
+        const items = paths.map(path => {
+            const label = path;
+            let icon = null;
+            try {
+                const file = Gio.File.new_for_path(path);
+                const info = file.query_info(
+                    Gio.FILE_ATTRIBUTE_STANDARD_ICON,
+                    Gio.FileQueryInfoFlags.NONE,
+                    null
+                );
+                if (info) icon = info.get_icon();
+            } catch (e) {
+                icon = Gio.ThemedIcon.new('folder');
+            }
+            if (!icon) icon = Gio.ThemedIcon.new('folder');
+            return {
+                label: label,
+                icon: icon,
+                data: path,
+                id: path,
+            };
+        });
+        this._actionMode = 'paths';
+        this._showItems(items, multi, hint, fullscreen);
     }
 
     hide() {
@@ -214,24 +304,37 @@ const DmenuUI = class {
 
     // ---------- Internal UI logic ----------
 
-    _showItems(items, multi) {
+    _showItems(items, multi, hint, fullscreen) {
         if (this._isOpen) this._closeInternal();
 
         this._allItems = items;
         this._multiSelectEnabled = multi;
+        this._fullscreen = fullscreen;
+        if (hint) {
+            this.entry.set_hint_text(hint);
+        } else {
+            this.entry.set_hint_text('Type to filter · Enter: select · Tab: multi-select · Esc: cancel');
+        }
         this.entry.set_text('');
         this._selectedIndex = 0;
         this._scrollStart = 0;
         this._selectedItems.clear();
+        this._filterTokens = [];
         this._isOpen = true;
 
         const monitor = Main.layoutManager.primaryMonitor;
-        this.actor.set_width(Math.min(1000, monitor.width - 100));
-        this.actor.set_height(Math.min(600, monitor.height - 150));
-        this.actor.set_position(
-            monitor.x + Math.floor((monitor.width - this.actor.width) / 2),
-            monitor.y + Math.floor(monitor.height / 6)
-        );
+        if (fullscreen) {
+            this.actor.set_width(monitor.width);
+            this.actor.set_height(monitor.height);
+            this.actor.set_position(monitor.x, monitor.y);
+        } else {
+            this.actor.set_width(Math.min(1000, monitor.width - 100));
+            this.actor.set_height(Math.min(600, monitor.height - 150));
+            this.actor.set_position(
+                monitor.x + Math.floor((monitor.width - this.actor.width) / 2),
+                monitor.y + Math.floor(monitor.height / 6)
+            );
+        }
 
         Main.layoutManager.addChrome(this.actor, { affectsInputRegion: true });
 
@@ -251,6 +354,7 @@ const DmenuUI = class {
         }
         Main.layoutManager.removeChrome(this.actor);
         this._isOpen = false;
+        this._filterTokens = [];
     }
 
     _onTextChanged() {
@@ -350,8 +454,6 @@ const DmenuUI = class {
         }
 
         if (selectedItems.length > 0) {
-            resultLabels = selectedItems.map(item => item.label);
-
             if (this._actionMode === 'drun') {
                 for (const item of selectedItems) {
                     const app = item.data;
@@ -363,6 +465,7 @@ const DmenuUI = class {
                         }
                     }
                 }
+                resultLabels = selectedItems.map(item => item.label);
             } else if (this._actionMode === 'window') {
                 const timestamp = global.get_current_time();
                 for (const item of selectedItems) {
@@ -380,8 +483,12 @@ const DmenuUI = class {
                         }
                     }
                 }
+                resultLabels = selectedItems.map(item => item.label);
+            } else if (this._actionMode === 'paths') {
+                resultLabels = selectedItems.map(item => item.data);
+            } else {
+                resultLabels = selectedItems.map(item => item.label);
             }
-            // stdin: nothing else
         }
 
         if (resultLabels.length > 0) {
@@ -396,6 +503,7 @@ const DmenuUI = class {
     _updateResults() {
         const filter = this.entry.get_text().trim().toLowerCase();
         const tokens = filter.split(/\s+/).filter(t => t.length > 0);
+        this._filterTokens = tokens;
 
         this._visibleItems = tokens.length === 0
             ? this._allItems
@@ -456,8 +564,9 @@ const DmenuUI = class {
                 });
             }
 
+            // Create label with markup support
+            const markup = highlightLabel(item.label, this._filterTokens);
             const label = new St.Label({
-                text: item.label,
                 style_class: i === this._selectedIndex
                     ? 'dmenu-result dmenu-result-selected'
                     : 'dmenu-result',
@@ -465,6 +574,8 @@ const DmenuUI = class {
                 x_align: Clutter.ActorAlign.FILL,
                 y_align: Clutter.ActorAlign.CENTER,
             });
+            // Use the underlying ClutterText to set markup
+            label.clutter_text.set_markup(markup);
 
             row.add_child(marker);
             if (iconActor) row.add_child(iconActor);
@@ -526,15 +637,19 @@ export default class SimpleDmenuExtension extends Extension {
         this._service = null;
     }
 
-    show(items, multi = false) {
-        this._ui.show(items, multi);
+    show(items, multi = false, hint = null, fullscreen = false) {
+        this._ui.show(items, multi, hint, fullscreen);
     }
 
-    showApps(multi) {
-        this._ui.showApps(multi);
+    showApps(multi = false, hint = null, fullscreen = false) {
+        this._ui.showApps(multi, hint, fullscreen);
     }
 
-    showWindows(multi) {
-        this._ui.showWindows(multi);
+    showWindows(multi = false, hint = null, fullscreen = false) {
+        this._ui.showWindows(multi, hint, fullscreen);
+    }
+
+    showPaths(paths, multi = false, hint = null, fullscreen = false) {
+        this._ui.showPaths(paths, multi, hint, fullscreen);
     }
 }

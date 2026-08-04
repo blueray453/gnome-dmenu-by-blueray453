@@ -31,20 +31,25 @@ function showHelp() {
 Usage:
   gdmenu [OPTIONS]
 
-Options:
-  --drun        Show applications (app launcher)
-  --window      Show open windows (window switcher)
-  --multi       Enable multi‑select (default: off)
-  --help        Show this help
+Modes (choose one):
+  --drun         Show applications (app launcher)
+  --window       Show open windows (window switcher)
+  --paths        Read file paths from stdin and show with icons
+  (no mode)      Read plain text lines from stdin
 
-If no mode is given, gdmenu reads lines from stdin and displays them.
+Options:
+  --multi        Enable multi‑select (default: off)
+  --hint TEXT    Custom hint text in search entry
+  --fullscreen   Make the menu fullscreen
+  --help         Show this help
 `);
 }
 
 function main() {
-    // Parse command line arguments
-    let mode = null;        // 'drun', 'window', or null (stdin)
+    let mode = null;        // 'drun', 'window', 'paths', or null (stdin)
     let multi = false;
+    let hint = '';
+    let fullscreen = false;
 
     for (let i = 0; i < ARGV.length; i++) {
         const arg = ARGV[i];
@@ -55,8 +60,19 @@ function main() {
             mode = 'drun';
         } else if (arg === '--window') {
             mode = 'window';
+        } else if (arg === '--paths') {
+            mode = 'paths';
         } else if (arg === '--multi') {
             multi = true;
+        } else if (arg === '--fullscreen') {
+            fullscreen = true;
+        } else if (arg === '--hint') {
+            if (i + 1 < ARGV.length) {
+                hint = ARGV[++i];
+            } else {
+                printerr('gdmenu: --hint requires an argument');
+                System.exit(1);
+            }
         } else {
             printerr(`Unknown option: ${arg}`);
             showHelp();
@@ -64,9 +80,9 @@ function main() {
         }
     }
 
-    // If no mode, read from stdin
+    // Read input based on mode
     let lines = [];
-    if (mode === null) {
+    if (mode === null || mode === 'paths') {
         lines = readStdinLines();
         if (lines.length === 0) {
             printerr('gdmenu: no input provided');
@@ -85,7 +101,6 @@ function main() {
         System.exit(2);
     }
 
-    // Subscribe to both outcomes BEFORE calling Show, so we can't miss a signal
     bus.signal_subscribe(
         null, INTERFACE_NAME, 'Selected', OBJECT_PATH, null,
         Gio.DBusSignalFlags.NONE,
@@ -125,7 +140,7 @@ function main() {
         if (mode === 'drun') {
             proxy.call_sync(
                 'ShowApps',
-                new GLib.Variant('(b)', [multi]),
+                new GLib.Variant('(bsb)', [multi, hint, fullscreen]),
                 Gio.DBusCallFlags.NONE,
                 -1,
                 null
@@ -133,16 +148,24 @@ function main() {
         } else if (mode === 'window') {
             proxy.call_sync(
                 'ShowWindows',
-                new GLib.Variant('(b)', [multi]),
+                new GLib.Variant('(bsb)', [multi, hint, fullscreen]),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                null
+            );
+        } else if (mode === 'paths') {
+            proxy.call_sync(
+                'ShowPaths',
+                new GLib.Variant('(asbsb)', [lines, multi, hint, fullscreen]),
                 Gio.DBusCallFlags.NONE,
                 -1,
                 null
             );
         } else {
-            // stdin mode: now we pass the multi flag as well
+            // stdin mode
             proxy.call_sync(
                 'Show',
-                new GLib.Variant('(asb)', [lines, multi]),
+                new GLib.Variant('(asbsb)', [lines, multi, hint, fullscreen]),
                 Gio.DBusCallFlags.NONE,
                 -1,
                 null

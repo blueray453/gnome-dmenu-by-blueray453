@@ -17,63 +17,61 @@
    green   #859900
 */
 
+/* Solarized Dark palette */
 .dmenu-container {
-    background-color: rgba(0, 43, 54, 0.97);       /* base03 */
-    border: 1px solid #073642;                      /* base02 */
-    border-radius: 16px;
-    padding: 24px;
-    spacing: 14px;
+    background-color: rgba(0, 43, 54, 0.97);
+    border: 1px solid #073642;
+    border-radius: 20px;
+    padding: 32px;
+    spacing: 18px;
 }
 
 .dmenu-entry {
-    font-size: 36px;
-    padding: 18px 16px;
-    border-radius: 10px;
-    background-color: #073642;                      /* base02 */
-    color: #eee8d5;                                  /* base2 */
+    font-size: 48px;
+    padding: 24px 20px;
+    border-radius: 12px;
+    background-color: #073642;
+    color: #eee8d5;
 }
 
 .dmenu-results-container {
-    spacing: 6px;
-}
-
-.dmenu-result-row {
     spacing: 8px;
 }
 
+.dmenu-result-row {
+    spacing: 12px;
+}
+
 .dmenu-marker {
-    font-size: 30px;
-    color: #2aa198;                                  /* cyan */
-    width: 32px;
+    font-size: 40px;
+    color: #2aa198;
+    width: 44px;
     text-align: center;
 }
 
-/* Icon styling */
 .dmenu-icon {
-    width: 32px;
-    height: 32px;
-    padding: 0 10px 0 0;
+    width: 48px;
+    height: 48px;
+    padding: 0 14px 0 0;
 }
 
 .dmenu-result {
-    font-size: 30px;
-    padding: 14px 16px;
-    color: #839496;                                  /* base0 */
-    border-radius: 8px;
+    font-size: 40px;
+    padding: 18px 20px;
+    color: #839496;
+    border-radius: 10px;
 }
 
 .dmenu-result-selected {
-    background-color: rgba(38, 139, 210, 0.45);       /* blue */
-    color: #fdf6e3;                                  /* base3 */
+    background-color: rgba(38, 139, 210, 0.45);
+    color: #fdf6e3;
 }
 
-/* Mouse hovering over a row */
 .dmenu-result-hover {
-    background-color: rgba(88, 110, 117, 0.25);       /* base01 */
+    background-color: rgba(88, 110, 117, 0.25);
 }
 
-/* Brief flash on click, before the menu closes */
 .dmenu-result-clicked {
-    background-color: rgba(133, 153, 0, 0.6);         /* green */
-    color: #fdf6e3;                                  /* base3 */
+    background-color: rgba(133, 153, 0, 0.6);
+    color: #fdf6e3;
 }
