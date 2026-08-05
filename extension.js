@@ -10,38 +10,45 @@ import { setLogging, setLogFn, journal } from './utils.js';
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
+
 const DBUS_INTERFACE = `<node>
-    <interface name="org.gnome.Shell.Extensions.SimpleDmenu">
-        <method name="Show">
-            <arg type="as" name="items" direction="in"/>
-            <arg type="b" name="multi" direction="in"/>
-            <arg type="s" name="hint" direction="in"/>
-            <arg type="b" name="fullscreen" direction="in"/>
-        </method>
-        <method name="ShowApps">
-            <arg type="b" name="multi" direction="in"/>
-            <arg type="s" name="hint" direction="in"/>
-            <arg type="b" name="fullscreen" direction="in"/>
-        </method>
-        <method name="ShowWindows">
-            <arg type="b" name="multi" direction="in"/>
-            <arg type="s" name="hint" direction="in"/>
-            <arg type="b" name="fullscreen" direction="in"/>
-        </method>
-        <method name="ShowPaths">
-            <arg type="as" name="paths" direction="in"/>
-            <arg type="b" name="multi" direction="in"/>
-            <arg type="s" name="hint" direction="in"/>
-            <arg type="b" name="fullscreen" direction="in"/>
-        </method>
-        <signal name="Selected">
-            <arg type="as" name="items"/>
-        </signal>
-        <signal name="Cancelled"/>
-    </interface>
+  <interface name="org.gnome.Shell.Extensions.SimpleDmenu">
+    <method name="Show">
+      <arg type="as" name="items" direction="in"/>
+      <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
+    </method>
+
+    <method name="ShowApps">
+      <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
+    </method>
+
+    <method name="ShowWindows">
+      <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
+    </method>
+
+    <method name="ShowPaths">
+      <arg type="as" name="paths" direction="in"/>
+      <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
+    </method>
+
+    <signal name="Selected">
+      <arg type="as" name="items"/>
+    </signal>
+
+    <signal name="Cancelled"/>
+  </interface>
 </node>`;
 
 const FILTER_DEBOUNCE_MS = 150;
+const SCROLL_TIME = 0.15;
 
 class DmenuService {
     constructor(extension) {
@@ -74,19 +81,29 @@ class DmenuService {
         this._dbusImpl.emit_signal('Cancelled', null);
     }
 
+    /**
+     * Exports the interface on the session bus and requests ownership of
+     * the well-known name. Both steps are guarded: a failure here, e.g. a
+     * second copy of the extension already owning the name, is logged
+     * instead of throwing out of Extension.enable().
+     */
     export() {
+        // 1. Clean up any previous export, if any.
         this._unexportInterface();
 
+        // 2. Release any previous bus-name ownership.
         if (this._ownerId) {
             Gio.bus_unown_name(this._ownerId);
             this._ownerId = null;
         }
 
+        // 3. Request the bus name and export the interface.
         this._ownerId = Gio.bus_own_name(
             Gio.BusType.SESSION,
             BUS_NAME,
             Gio.BusNameOwnerFlags.NONE,
             (connection) => {
+                // Bus acquired: export the interface on this connection.
                 try {
                     this._dbusImpl.export(connection, OBJECT_PATH);
                     journal(`D-Bus interface exported on ${OBJECT_PATH}`);
@@ -97,9 +114,11 @@ class DmenuService {
                 }
             },
             (connection, name) => {
+                // Name acquired.
                 journal(`${name}: name acquired`);
             },
             (connection, name) => {
+                // Name lost: clean up.
                 journal(`${name}: name lost — another instance may already own it`, true);
                 this._unexportInterface();
                 this._ownerId = null;
@@ -108,14 +127,19 @@ class DmenuService {
     }
 
     unexport() {
+        // Release the bus name. This triggers the name-lost callback,
+        // which calls _unexportInterface().
         if (this._ownerId) {
             Gio.bus_unown_name(this._ownerId);
             this._ownerId = null;
         }
+
+        // Also directly unexport in case the name-lost callback has not fired yet.
         this._unexportInterface();
     }
 
     _unexportInterface() {
+        // Idempotent cleanup: ignore "not exported" errors.
         try {
             if (this._dbusImpl) {
                 this._dbusImpl.unexport();
@@ -123,16 +147,19 @@ class DmenuService {
             }
         } catch (e) {
             if (!e.message.includes('not exported')) {
-                journal(`Failed to unexport D‑Bus interface: ${e.message}`, true);
+                journal(`Failed to unexport D-Bus interface: ${e.message}`, true);
             }
         }
     }
 }
 
+/**
+ * Generate Pango markup with <b> tags around each occurrence of tokens in label.
+ * Tokens are matched case-insensitively.
+ */
 function highlightLabel(label, tokens) {
-    if (!tokens || tokens.length === 0) {
+    if (!tokens || tokens.length === 0)
         return GLib.markup_escape_text(label, -1);
-    }
 
     const escaped = GLib.markup_escape_text(label, -1);
     const lowerLabel = label.toLowerCase();
@@ -141,13 +168,18 @@ function highlightLabel(label, tokens) {
     for (const token of tokens) {
         const lowerToken = token.toLowerCase();
         let idx = lowerLabel.indexOf(lowerToken);
+
         while (idx !== -1) {
-            intervals.push({ start: idx, end: idx + lowerToken.length });
+            intervals.push({
+                start: idx,
+                end: idx + lowerToken.length,
+            });
             idx = lowerLabel.indexOf(lowerToken, idx + 1);
         }
     }
 
-    if (intervals.length === 0) return escaped;
+    if (intervals.length === 0)
+        return escaped;
 
     intervals.sort((a, b) => a.start - b.start);
 
@@ -155,25 +187,26 @@ function highlightLabel(label, tokens) {
     for (let i = 1; i < intervals.length; i++) {
         const last = merged[merged.length - 1];
         const cur = intervals[i];
-        if (cur.start <= last.end) {
+
+        if (cur.start <= last.end)
             last.end = Math.max(last.end, cur.end);
-        } else {
+        else
             merged.push(cur);
-        }
     }
 
     let markup = '';
     let pos = 0;
+
     for (const interval of merged) {
-        if (interval.start > pos) {
+        if (interval.start > pos)
             markup += escaped.substring(pos, interval.start);
-        }
-        markup += '<b>' + escaped.substring(interval.start, interval.end) + '</b>';
+
+        markup += `<b>${escaped.substring(interval.start, interval.end)}</b>`;
         pos = interval.end;
     }
-    if (pos < escaped.length) {
+
+    if (pos < escaped.length)
         markup += escaped.substring(pos);
-    }
 
     return markup;
 }
@@ -232,6 +265,7 @@ const DmenuUI = class {
         this._selectedIndex = 0;
         this._selectedItems = new Set();
         this._filterTimeoutId = null;
+        this._scrollIdleId = null;
         this._isOpen = false;
         this._multiSelectEnabled = false;
         this._fullscreen = false;
@@ -243,8 +277,11 @@ const DmenuUI = class {
 
     show(items, multi = false, hint = null, fullscreen = false) {
         const idMap = new Map();
+
         const itemObjects = items.map((item, index) => {
-            let label, id;
+            let label;
+            let id;
+
             if (typeof item === 'string') {
                 label = item;
                 id = item;
@@ -252,15 +289,17 @@ const DmenuUI = class {
                 label = item.label;
                 id = item.id || item.label;
             }
-            if (idMap.has(id)) {
+
+            if (idMap.has(id))
                 id = `${id}_${index}`;
-            }
+
             idMap.set(id, true);
+
             return {
-                label: label,
+                label,
                 icon: item.icon || null,
                 data: item.data || null,
-                id: id,
+                id,
             };
         });
 
@@ -269,13 +308,14 @@ const DmenuUI = class {
     }
 
     showApps(multi = false, hint = null, fullscreen = false) {
-        let appSystem = Shell.AppSystem.get_default();
+        const appSystem = Shell.AppSystem.get_default();
         let apps = [];
-        if (appSystem && typeof appSystem.get_all === 'function') {
+
+        if (appSystem && typeof appSystem.get_all === 'function')
             apps = appSystem.get_all().filter(a => a.should_show());
-        } else {
+        else
             apps = Gio.AppInfo.get_all().filter(a => a.should_show());
-        }
+
         apps.sort((a, b) => a.get_name().localeCompare(b.get_name()));
 
         const items = apps.map(a => ({
@@ -291,21 +331,24 @@ const DmenuUI = class {
 
     showWindows(multi = false, hint = null, fullscreen = false) {
         const windows = global.display.get_tab_list(Meta.TabList.NORMAL, null);
+
         let tracker = null;
-        if (typeof Shell.WindowTracker.get_default === 'function') {
+        if (typeof Shell.WindowTracker.get_default === 'function')
             tracker = Shell.WindowTracker.get_default();
-        } else {
+        else
             tracker = Main.windowTracker;
-        }
 
         const items = windows.map(w => {
             let title = w.get_title();
-            if (!title || title.trim() === '') title = 'Untitled';
-            let app = tracker ? tracker.get_window_app(w) : null;
+            if (!title || title.trim() === '')
+                title = 'Untitled';
+
+            const app = tracker ? tracker.get_window_app(w) : null;
             const icon = app ? app.get_icon() : Gio.ThemedIcon.new('application-x-executable');
+
             return {
                 label: title,
-                icon: icon,
+                icon,
                 data: w,
                 id: String(w.get_id()),
             };
@@ -319,6 +362,7 @@ const DmenuUI = class {
         const items = paths.map(path => {
             const label = path;
             let icon = null;
+
             try {
                 const file = Gio.File.new_for_path(path);
                 const info = file.query_info(
@@ -326,14 +370,19 @@ const DmenuUI = class {
                     Gio.FileQueryInfoFlags.NONE,
                     null
                 );
-                if (info) icon = info.get_icon();
+
+                if (info)
+                    icon = info.get_icon();
             } catch (e) {
                 icon = Gio.ThemedIcon.new('folder');
             }
-            if (!icon) icon = Gio.ThemedIcon.new('folder');
+
+            if (!icon)
+                icon = Gio.ThemedIcon.new('folder');
+
             return {
-                label: label,
-                icon: icon,
+                label,
+                icon,
                 data: path,
                 id: path,
             };
@@ -350,7 +399,13 @@ const DmenuUI = class {
     // ---------- Internal UI logic ----------
 
     _showItems(items, multi, hint, fullscreen) {
-        if (this._isOpen) this._closeInternal();
+        if (this._isOpen)
+            this._closeInternal();
+
+        if (this._scrollIdleId) {
+            GLib.source_remove(this._scrollIdleId);
+            this._scrollIdleId = null;
+        }
 
         this._allItems = items;
         this._multiSelectEnabled = multi;
@@ -388,7 +443,9 @@ const DmenuUI = class {
         Main.layoutManager.addChrome(this.actor, { affectsInputRegion: true });
 
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-            if (this._isOpen) this.entry.grab_key_focus();
+            if (this._isOpen)
+                this.entry.grab_key_focus();
+
             return GLib.SOURCE_REMOVE;
         });
 
@@ -396,12 +453,18 @@ const DmenuUI = class {
     }
 
     _closeInternal() {
-        if (!this._isOpen) return;
-
         if (this._filterTimeoutId) {
             GLib.source_remove(this._filterTimeoutId);
             this._filterTimeoutId = null;
         }
+
+        if (this._scrollIdleId) {
+            GLib.source_remove(this._scrollIdleId);
+            this._scrollIdleId = null;
+        }
+
+        if (!this._isOpen)
+            return;
 
         Main.layoutManager.removeChrome(this.actor);
         this._isOpen = false;
@@ -410,61 +473,103 @@ const DmenuUI = class {
     }
 
     /**
-    * Scrolls the native ScrollView so the currently selected row is fully
-    * visible. Uses the actor's real allocation box so CSS margins, padding,
-    * and variable row heights are all accounted for correctly.
-    */
+     * Scrolls the native ScrollView so the currently selected row is fully
+     * visible. This waits one idle cycle so Clutter can allocate the newly
+     * created row actors before reading their allocation boxes.
+     */
     _scrollSelectedIntoView() {
-        if (this._rowActors.length === 0) return;
+        if (this._rowActors.length === 0)
+            return;
+
         const selectedRow = this._rowActors[this._selectedIndex];
-        if (!selectedRow) return;
+        if (!selectedRow)
+            return;
 
-        // Defer to the next idle cycle so Clutter can calculate the
-        // allocation boxes (height / y-position) for the newly added rows.
-        // GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-            // Ensure the UI is still open and the row hasn't been destroyed
-        if (!this._isOpen || !selectedRow.get_parent()) {
+        const SCROLL_TIME = 0.15;
+
+        /*
+         * Wait one idle cycle so Clutter can allocate the newly created rows.
+         * Without this, get_allocation_box() may still return zero-sized boxes.
+         */
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            if (!this._isOpen || !this._rowActors.includes(selectedRow))
+                return GLib.SOURCE_REMOVE;
+
+            const scrollView = this.results_container;
+            const adjustment = scrollView.vadjustment;
+
+            if (!adjustment)
+                return GLib.SOURCE_REMOVE;
+
+            const lower = adjustment.lower || 0;
+            const upper = adjustment.upper || 0;
+
+            let pageSize = adjustment.page_size;
+            if (!pageSize)
+                pageSize = scrollView.height;
+
+            if (!pageSize)
+                return GLib.SOURCE_REMOVE;
+
+            /*
+             * If the scroll view has a fade effect, avoid scrolling the selected
+             * row underneath the faded top/bottom area.
+             */
+            let offset = 0;
+            const vfade = scrollView.get_effect('fade');
+            if (vfade && vfade.fade_margins)
+                offset = vfade.fade_margins.top || 0;
+
+            /*
+             * Get the selected row's allocation box and translate its coordinates
+             * up through its parents until we reach the scroll view.
+             */
+            let box = selectedRow.get_allocation_box();
+            let y1 = box.y1;
+            let y2 = box.y2;
+
+            let parent = selectedRow.get_parent();
+            while (parent && parent !== scrollView) {
+                box = parent.get_allocation_box();
+                y1 += box.y1;
+                y2 += box.y1;
+                parent = parent.get_parent();
+            }
+
+            if (parent !== scrollView)
+                return GLib.SOURCE_REMOVE;
+
+            const currentValue = adjustment.value;
+            let newValue = currentValue;
+
+            if (y1 < currentValue + offset) {
+                // Selected row is above the visible area.
+                newValue = y1 - offset;
+            } else if (y2 > currentValue + pageSize - offset) {
+                // Selected row is below the visible area.
+                newValue = y2 + offset - pageSize;
+            } else {
+                // Already fully visible.
+                return GLib.SOURCE_REMOVE;
+            }
+
+            const maxValue = Math.max(lower, upper - pageSize);
+            newValue = Math.max(lower, Math.min(newValue, maxValue));
+
+            if (newValue === currentValue)
+                return GLib.SOURCE_REMOVE;
+
+            if (typeof adjustment.ease === 'function') {
+                adjustment.ease(newValue, {
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    duration: SCROLL_TIME,
+                });
+            } else {
+                adjustment.value = newValue;
+            }
+
             return GLib.SOURCE_REMOVE;
-        }
-
-        // 1. Get the St.Adjustment from the scroll view
-        const adjustment = this.results_container.vadjustment;
-        if (!adjustment) return GLib.SOURCE_REMOVE;
-
-        // 2. Read the current value, page size, and bounds of the adjustment
-        const currentValue = adjustment.value;
-        const pageSize = adjustment.page_size;
-        const upperBound = adjustment.upper;
-
-        // 3. Compute the actor's allocation (relative position inside
-        //    the scrollable content container)
-        const alloc = selectedRow.get_allocation_box();
-        const rowTop = alloc.y1;
-        const rowBottom = alloc.y2;
-
-        // 4. Calculate the new value so the target actor falls cleanly
-        //    within the visible region limits
-        let newValue = currentValue;
-
-        if (rowTop < currentValue) {
-            // Actor is above the visible area → scroll up
-            newValue = rowTop;
-        } else if (rowBottom > currentValue + pageSize) {
-            // Actor is below the visible area → scroll down
-            newValue = rowBottom - pageSize;
-        }
-
-        // Clamp the new value to the adjustment bounds
-        const maxValue = Math.max(0, upperBound - pageSize);
-        newValue = Math.max(0, Math.min(newValue, maxValue));
-
-        // 5. Shift the view
-        if (newValue !== currentValue) {
-            adjustment.value = newValue;
-        }
-
-        //     return GLib.SOURCE_REMOVE;
-        // });
+        });
     }
 
     _onTextChanged() {
@@ -475,6 +580,7 @@ const DmenuUI = class {
             this._selectedIndex = 0;
             this._updateResults();
             this._filterTimeoutId = null;
+
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -508,8 +614,10 @@ const DmenuUI = class {
         if (this._multiSelectEnabled) {
             if (sym === Clutter.KEY_Tab) {
                 this._toggleCurrent();
+
                 if (this._visibleItems.length > 0)
                     this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
+
                 this._render();
                 return Clutter.EVENT_STOP;
             }
@@ -521,10 +629,12 @@ const DmenuUI = class {
             }
 
             if ((sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) &&
-            (mods & Clutter.ModifierType.SHIFT_MASK)) {
+                (mods & Clutter.ModifierType.SHIFT_MASK)) {
                 this._toggleCurrent();
+
                 if (this._visibleItems.length > 0)
                     this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
+
                 this._render();
                 return Clutter.EVENT_STOP;
             }
@@ -534,8 +644,11 @@ const DmenuUI = class {
     }
 
     _toggleCurrent() {
-        if (!this._multiSelectEnabled) return;
-        if (this._visibleItems.length === 0 || this._selectedIndex >= this._visibleItems.length) return;
+        if (!this._multiSelectEnabled)
+            return;
+
+        if (this._visibleItems.length === 0 || this._selectedIndex >= this._visibleItems.length)
+            return;
 
         const item = this._visibleItems[this._selectedIndex];
         const id = item.id;
@@ -564,6 +677,7 @@ const DmenuUI = class {
             if (this._actionMode === 'drun') {
                 for (const item of selectedItems) {
                     const app = item.data;
+
                     if (app && typeof app.launch === 'function') {
                         try {
                             app.launch([], null);
@@ -572,24 +686,27 @@ const DmenuUI = class {
                         }
                     }
                 }
+
                 resultLabels = selectedItems.map(item => item.label);
             } else if (this._actionMode === 'window') {
                 const timestamp = global.get_current_time();
+
                 for (const item of selectedItems) {
                     const win = item.data;
+
                     if (win) {
                         try {
                             const workspace = win.get_workspace();
-                            if (workspace) {
+                            if (workspace)
                                 workspace.activate_with_focus(win, timestamp);
-                            } else {
+                            else
                                 win.activate(timestamp);
-                            }
                         } catch (e) {
                             journal(`Failed to activate window ${item.label}: ${e.message}`, true);
                         }
                     }
                 }
+
                 resultLabels = selectedItems.map(item => item.label);
             } else if (this._actionMode === 'paths') {
                 resultLabels = selectedItems.map(item => item.data);
@@ -598,11 +715,10 @@ const DmenuUI = class {
             }
         }
 
-        if (resultLabels.length > 0) {
+        if (resultLabels.length > 0)
             this._service.emitSelected(resultLabels);
-        } else {
+        else
             this._service.emitCancelled();
-        }
 
         this.hide();
     }
@@ -610,14 +726,15 @@ const DmenuUI = class {
     _updateResults() {
         const filter = this.entry.get_text().trim().toLowerCase();
         const tokens = filter.split(/\s+/).filter(t => t.length > 0);
+
         this._filterTokens = tokens;
 
         this._visibleItems = tokens.length === 0
-        ? this._allItems
-        : this._allItems.filter(item => {
-            const lower = item.label.toLowerCase();
-            return tokens.every(tok => lower.includes(tok));
-        });
+            ? this._allItems
+            : this._allItems.filter(item => {
+                const lower = item.label.toLowerCase();
+                return tokens.every(tok => lower.includes(tok));
+            });
 
         this._render();
     }
@@ -637,7 +754,10 @@ const DmenuUI = class {
                 track_hover: true,
             });
 
-            const markerText = this._multiSelectEnabled && this._selectedItems.has(item.id) ? '●' : '';
+            const markerText = this._multiSelectEnabled && this._selectedItems.has(item.id)
+                ? '●'
+                : '';
+
             const marker = new St.Label({
                 text: markerText,
                 style_class: 'dmenu-marker',
@@ -654,10 +774,11 @@ const DmenuUI = class {
             }
 
             const markup = highlightLabel(item.label, this._filterTokens);
+
             const label = new St.Label({
                 style_class: i === this._selectedIndex
-                ? 'dmenu-result dmenu-result-selected'
-                : 'dmenu-result',
+                    ? 'dmenu-result dmenu-result-selected'
+                    : 'dmenu-result',
                 x_expand: true,
                 x_align: Clutter.ActorAlign.FILL,
                 y_align: Clutter.ActorAlign.CENTER,
@@ -666,7 +787,10 @@ const DmenuUI = class {
             label.clutter_text.set_markup(markup);
 
             row.add_child(marker);
-            if (iconActor) row.add_child(iconActor);
+
+            if (iconActor)
+                row.add_child(iconActor);
+
             row.add_child(label);
 
             row.connect('enter-event', () => {
@@ -680,14 +804,17 @@ const DmenuUI = class {
             });
 
             const rowIndex = i;
+
             row.connect('button-press-event', () => {
                 label.remove_style_class_name('dmenu-result-hover');
                 label.add_style_class_name('dmenu-result-clicked');
                 this._selectedIndex = rowIndex;
+
                 GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
                     this._activate();
                     return GLib.SOURCE_REMOVE;
                 });
+
                 return Clutter.EVENT_STOP;
             });
 
@@ -702,17 +829,21 @@ const DmenuUI = class {
 export default class SimpleDmenuExtension extends Extension {
     enable() {
         setLogFn((msg, error = false) => {
-            let level = error ? GLib.LogLevelFlags.LEVEL_CRITICAL : GLib.LogLevelFlags.LEVEL_MESSAGE;
+            const level = error
+                ? GLib.LogLevelFlags.LEVEL_CRITICAL
+                : GLib.LogLevelFlags.LEVEL_MESSAGE;
+
             GLib.log_structured(
                 'gnome-dmenu-by-blueray453',
                 level,
                 {
                     MESSAGE: `${msg}`,
                     SYSLOG_IDENTIFIER: 'gnome-dmenu-by-blueray453',
-                    CODE_FILE: GLib.filename_from_uri(import.meta.url)[0]
+                    CODE_FILE: GLib.filename_from_uri(import.meta.url)[0],
                 }
             );
         });
+
         setLogging(true);
         journal('Enabled');
 
