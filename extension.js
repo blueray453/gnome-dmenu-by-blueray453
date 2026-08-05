@@ -4,45 +4,41 @@ import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import Shell from 'gi://Shell';
 import Meta from 'gi://Meta';
-
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-
 import { setLogging, setLogFn, journal } from './utils.js';
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
-
-const DBUS_INTERFACE = `
-<node>
-  <interface name="org.gnome.Shell.Extensions.SimpleDmenu">
-    <method name="Show">
-      <arg type="as" name="items" direction="in"/>
-      <arg type="b" name="multi" direction="in"/>
-      <arg type="s" name="hint" direction="in"/>
-      <arg type="b" name="fullscreen" direction="in"/>
-    </method>
-    <method name="ShowApps">
-      <arg type="b" name="multi" direction="in"/>
-      <arg type="s" name="hint" direction="in"/>
-      <arg type="b" name="fullscreen" direction="in"/>
-    </method>
-    <method name="ShowWindows">
-      <arg type="b" name="multi" direction="in"/>
-      <arg type="s" name="hint" direction="in"/>
-      <arg type="b" name="fullscreen" direction="in"/>
-    </method>
-    <method name="ShowPaths">
-      <arg type="as" name="paths" direction="in"/>
-      <arg type="b" name="multi" direction="in"/>
-      <arg type="s" name="hint" direction="in"/>
-      <arg type="b" name="fullscreen" direction="in"/>
-    </method>
-    <signal name="Selected">
-      <arg type="as" name="items"/>
-    </signal>
-    <signal name="Cancelled"/>
-  </interface>
+const DBUS_INTERFACE = `<node>
+    <interface name="org.gnome.Shell.Extensions.SimpleDmenu">
+        <method name="Show">
+            <arg type="as" name="items" direction="in"/>
+            <arg type="b" name="multi" direction="in"/>
+            <arg type="s" name="hint" direction="in"/>
+            <arg type="b" name="fullscreen" direction="in"/>
+        </method>
+        <method name="ShowApps">
+            <arg type="b" name="multi" direction="in"/>
+            <arg type="s" name="hint" direction="in"/>
+            <arg type="b" name="fullscreen" direction="in"/>
+        </method>
+        <method name="ShowWindows">
+            <arg type="b" name="multi" direction="in"/>
+            <arg type="s" name="hint" direction="in"/>
+            <arg type="b" name="fullscreen" direction="in"/>
+        </method>
+        <method name="ShowPaths">
+            <arg type="as" name="paths" direction="in"/>
+            <arg type="b" name="multi" direction="in"/>
+            <arg type="s" name="hint" direction="in"/>
+            <arg type="b" name="fullscreen" direction="in"/>
+        </method>
+        <signal name="Selected">
+            <arg type="as" name="items"/>
+        </signal>
+        <signal name="Cancelled"/>
+    </interface>
 </node>`;
 
 const FILTER_DEBOUNCE_MS = 150;
@@ -78,31 +74,19 @@ class DmenuService {
         this._dbusImpl.emit_signal('Cancelled', null);
     }
 
-    /**
-     * Exports the interface on the session bus and requests ownership of
-     * the well‑known name. Both steps are guarded: a failure here (e.g. a
-     * second copy of the extension already owning the name) is logged
-     * instead of throwing out of Extension.enable().
-     */
-    // Inside your extension class
-
     export() {
-        // 1. Clean up any previous export (if any)
         this._unexportInterface();
 
-        // 2. Release any previous bus‑name ownership
         if (this._ownerId) {
             Gio.bus_unown_name(this._ownerId);
             this._ownerId = null;
         }
 
-        // 3. Request the bus name and export the interface
         this._ownerId = Gio.bus_own_name(
             Gio.BusType.SESSION,
             BUS_NAME,
             Gio.BusNameOwnerFlags.NONE,
             (connection) => {
-                // bus acquired – export the interface on this connection
                 try {
                     this._dbusImpl.export(connection, OBJECT_PATH);
                     journal(`D-Bus interface exported on ${OBJECT_PATH}`);
@@ -113,11 +97,9 @@ class DmenuService {
                 }
             },
             (connection, name) => {
-                // name acquired
                 journal(`${name}: name acquired`);
             },
             (connection, name) => {
-                // name lost – clean up
                 journal(`${name}: name lost — another instance may already own it`, true);
                 this._unexportInterface();
                 this._ownerId = null;
@@ -126,17 +108,14 @@ class DmenuService {
     }
 
     unexport() {
-        // Release the bus name (this triggers the name‑lost callback, which calls _unexportInterface)
         if (this._ownerId) {
             Gio.bus_unown_name(this._ownerId);
             this._ownerId = null;
         }
-        // Also directly unexport in case the name‑lost callback hasn't fired yet
         this._unexportInterface();
     }
 
     _unexportInterface() {
-        // Idempotent cleanup: ignore "not exported" errors
         try {
             if (this._dbusImpl) {
                 this._dbusImpl.unexport();
@@ -150,17 +129,15 @@ class DmenuService {
     }
 }
 
-/**
- * Generate Pango markup with <b> tags around each occurrence of tokens in label.
- * Tokens are matched case‑insensitively.
- */
 function highlightLabel(label, tokens) {
     if (!tokens || tokens.length === 0) {
         return GLib.markup_escape_text(label, -1);
     }
+
     const escaped = GLib.markup_escape_text(label, -1);
     const lowerLabel = label.toLowerCase();
     const intervals = [];
+
     for (const token of tokens) {
         const lowerToken = token.toLowerCase();
         let idx = lowerLabel.indexOf(lowerToken);
@@ -169,9 +146,11 @@ function highlightLabel(label, tokens) {
             idx = lowerLabel.indexOf(lowerToken, idx + 1);
         }
     }
+
     if (intervals.length === 0) return escaped;
 
     intervals.sort((a, b) => a.start - b.start);
+
     const merged = [intervals[0]];
     for (let i = 1; i < intervals.length; i++) {
         const last = merged[merged.length - 1];
@@ -195,6 +174,7 @@ function highlightLabel(label, tokens) {
     if (pos < escaped.length) {
         markup += escaped.substring(pos);
     }
+
     return markup;
 }
 
@@ -224,11 +204,13 @@ const DmenuUI = class {
             y_expand: true,
             reactive: true,
         });
+
         this.results_box = new St.BoxLayout({
             style_class: 'dmenu-results-box',
             vertical: true,
             reactive: true,
         });
+
         this.results_container.set_child(this.results_box);
 
         this.actor.add_child(this.entry);
@@ -255,7 +237,6 @@ const DmenuUI = class {
         this._fullscreen = false;
         this._actionMode = 'stdin';
         this._filterTokens = [];
-        this._rowHeight = null; // cached uniform row height, measured lazily
     }
 
     // ---------- Public API ----------
@@ -282,6 +263,7 @@ const DmenuUI = class {
                 id: id,
             };
         });
+
         this._actionMode = 'stdin';
         this._showItems(itemObjects, multi, hint, fullscreen);
     }
@@ -295,12 +277,14 @@ const DmenuUI = class {
             apps = Gio.AppInfo.get_all().filter(a => a.should_show());
         }
         apps.sort((a, b) => a.get_name().localeCompare(b.get_name()));
+
         const items = apps.map(a => ({
             label: a.get_name(),
             icon: a.get_icon(),
             data: a,
             id: a.get_id(),
         }));
+
         this._actionMode = 'drun';
         this._showItems(items, multi, hint, fullscreen);
     }
@@ -313,6 +297,7 @@ const DmenuUI = class {
         } else {
             tracker = Main.windowTracker;
         }
+
         const items = windows.map(w => {
             let title = w.get_title();
             if (!title || title.trim() === '') title = 'Untitled';
@@ -325,6 +310,7 @@ const DmenuUI = class {
                 id: String(w.get_id()),
             };
         });
+
         this._actionMode = 'window';
         this._showItems(items, multi, hint, fullscreen);
     }
@@ -352,6 +338,7 @@ const DmenuUI = class {
                 id: path,
             };
         });
+
         this._actionMode = 'paths';
         this._showItems(items, multi, hint, fullscreen);
     }
@@ -368,6 +355,7 @@ const DmenuUI = class {
         this._allItems = items;
         this._multiSelectEnabled = multi;
         this._fullscreen = fullscreen;
+
         if (hint) {
             this.entry.set_hint_text(hint);
         } else if (multi) {
@@ -375,14 +363,15 @@ const DmenuUI = class {
         } else {
             this.entry.set_hint_text('Type to filter · Enter: select · Esc: cancel');
         }
+
         this.entry.set_text('');
         this._selectedIndex = 0;
         this._selectedItems.clear();
         this._filterTokens = [];
-        this._rowHeight = null; // re-measure against current stylesheet on each open
         this._isOpen = true;
 
         const monitor = Main.layoutManager.primaryMonitor;
+
         if (fullscreen) {
             this.actor.set_width(monitor.width);
             this.actor.set_height(monitor.height);
@@ -408,10 +397,12 @@ const DmenuUI = class {
 
     _closeInternal() {
         if (!this._isOpen) return;
+
         if (this._filterTimeoutId) {
             GLib.source_remove(this._filterTimeoutId);
             this._filterTimeoutId = null;
         }
+
         Main.layoutManager.removeChrome(this.actor);
         this._isOpen = false;
         this._filterTokens = [];
@@ -419,80 +410,61 @@ const DmenuUI = class {
     }
 
     /**
-     * Measures (and caches) the natural height of a single result row using
-     * the live theme/stylesheet, so we can compute scroll offsets without
-     * waiting for a full Clutter allocation pass. All rows share the same
-     * style classes, so a single measurement is valid for all of them.
-     */
-    _measureRowHeight() {
-        if (this._rowHeight) return this._rowHeight;
-
-        try {
-            const probeRow = new St.BoxLayout({
-                vertical: false,
-                style_class: 'dmenu-result-row',
-            });
-            const probeMarker = new St.Label({
-                text: '●',
-                style_class: 'dmenu-marker',
-            });
-            const probeLabel = new St.Label({
-                style_class: 'dmenu-result',
-            });
-            probeLabel.clutter_text.set_text('Probe row for height measurement');
-
-            probeRow.add_child(probeMarker);
-            probeRow.add_child(probeLabel);
-            this.results_box.add_child(probeRow);
-
-            const [, naturalHeight] = probeRow.get_preferred_height(-1);
-
-            this.results_box.remove_child(probeRow);
-            probeRow.destroy();
-
-            if (naturalHeight > 0) this._rowHeight = naturalHeight;
-        } catch (e) {
-            journal(`Row height measurement failed: ${e.message}`, true);
-        }
-
-        return this._rowHeight;
-    }
-
-    /**
-     * Scrolls the native ScrollView so the currently selected row is fully
-     * visible. Because _render() now adds every visible item as a real
-     * child, the ScrollView's adjustment (and therefore its scrollbar)
-     * always reflects the true size/position of the full list — this just
-     * nudges the scroll position, it doesn't fake the scrollbar itself.
-     */
+    * Scrolls the native ScrollView so the currently selected row is fully
+    * visible. Uses the actor's real allocation box so CSS margins, padding,
+    * and variable row heights are all accounted for correctly.
+    */
     _scrollSelectedIntoView() {
         if (this._rowActors.length === 0) return;
+        const selectedRow = this._rowActors[this._selectedIndex];
+        if (!selectedRow) return;
 
-        const adjustment = this.results_container.vadjustment;
-        if (!adjustment) return;
-
-        const rowHeight = this._measureRowHeight();
-        if (!rowHeight) return;
-
-        const containerHeight = adjustment.page_size > 0
-            ? adjustment.page_size
-            : this.results_container.height;
-        if (!containerHeight) return;
-
-        const rowTop = this._selectedIndex * rowHeight;
-        const rowBottom = rowTop + rowHeight;
-
-        let value = adjustment.value;
-        if (rowTop < value) {
-            value = rowTop;
-        } else if (rowBottom > value + containerHeight) {
-            value = rowBottom - containerHeight;
+        // Defer to the next idle cycle so Clutter can calculate the
+        // allocation boxes (height / y-position) for the newly added rows.
+        // GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            // Ensure the UI is still open and the row hasn't been destroyed
+        if (!this._isOpen || !selectedRow.get_parent()) {
+            return GLib.SOURCE_REMOVE;
         }
 
-        const maxValue = Math.max(0, adjustment.upper - containerHeight);
-        value = Math.max(0, Math.min(value, maxValue));
+        // 1. Get the St.Adjustment from the scroll view
+        const adjustment = this.results_container.vadjustment;
+        if (!adjustment) return GLib.SOURCE_REMOVE;
 
-        adjustment.value = value;
+        // 2. Read the current value, page size, and bounds of the adjustment
+        const currentValue = adjustment.value;
+        const pageSize = adjustment.page_size;
+        const upperBound = adjustment.upper;
+
+        // 3. Compute the actor's allocation (relative position inside
+        //    the scrollable content container)
+        const alloc = selectedRow.get_allocation_box();
+        const rowTop = alloc.y1;
+        const rowBottom = alloc.y2;
+
+        // 4. Calculate the new value so the target actor falls cleanly
+        //    within the visible region limits
+        let newValue = currentValue;
+
+        if (rowTop < currentValue) {
+            // Actor is above the visible area → scroll up
+            newValue = rowTop;
+        } else if (rowBottom > currentValue + pageSize) {
+            // Actor is below the visible area → scroll down
+            newValue = rowBottom - pageSize;
+        }
+
+        // Clamp the new value to the adjustment bounds
+        const maxValue = Math.max(0, upperBound - pageSize);
+        newValue = Math.max(0, Math.min(newValue, maxValue));
+
+        // 5. Shift the view
+        if (newValue !== currentValue) {
+            adjustment.value = newValue;
+        }
+
+        //     return GLib.SOURCE_REMOVE;
+        // });
     }
 
     _onTextChanged() {
@@ -549,7 +521,7 @@ const DmenuUI = class {
             }
 
             if ((sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) &&
-                (mods & Clutter.ModifierType.SHIFT_MASK)) {
+            (mods & Clutter.ModifierType.SHIFT_MASK)) {
                 this._toggleCurrent();
                 if (this._visibleItems.length > 0)
                     this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
@@ -564,8 +536,10 @@ const DmenuUI = class {
     _toggleCurrent() {
         if (!this._multiSelectEnabled) return;
         if (this._visibleItems.length === 0 || this._selectedIndex >= this._visibleItems.length) return;
+
         const item = this._visibleItems[this._selectedIndex];
         const id = item.id;
+
         if (this._selectedItems.has(id))
             this._selectedItems.delete(id);
         else
@@ -639,11 +613,11 @@ const DmenuUI = class {
         this._filterTokens = tokens;
 
         this._visibleItems = tokens.length === 0
-            ? this._allItems
-            : this._allItems.filter(item => {
-                const lower = item.label.toLowerCase();
-                return tokens.every(tok => lower.includes(tok));
-            });
+        ? this._allItems
+        : this._allItems.filter(item => {
+            const lower = item.label.toLowerCase();
+            return tokens.every(tok => lower.includes(tok));
+        });
 
         this._render();
     }
@@ -654,6 +628,7 @@ const DmenuUI = class {
 
         for (let i = 0; i < this._visibleItems.length; i++) {
             const item = this._visibleItems[i];
+
             const row = new St.BoxLayout({
                 vertical: false,
                 style_class: 'dmenu-result-row',
@@ -678,17 +653,16 @@ const DmenuUI = class {
                 });
             }
 
-            // Create label with markup support
             const markup = highlightLabel(item.label, this._filterTokens);
             const label = new St.Label({
                 style_class: i === this._selectedIndex
-                    ? 'dmenu-result dmenu-result-selected'
-                    : 'dmenu-result',
+                ? 'dmenu-result dmenu-result-selected'
+                : 'dmenu-result',
                 x_expand: true,
                 x_align: Clutter.ActorAlign.FILL,
                 y_align: Clutter.ActorAlign.CENTER,
             });
-            // Use the underlying ClutterText to set markup
+
             label.clutter_text.set_markup(markup);
 
             row.add_child(marker);
@@ -699,6 +673,7 @@ const DmenuUI = class {
                 label.add_style_class_name('dmenu-result-hover');
                 return Clutter.EVENT_PROPAGATE;
             });
+
             row.connect('leave-event', () => {
                 label.remove_style_class_name('dmenu-result-hover');
                 return Clutter.EVENT_PROPAGATE;
@@ -709,7 +684,6 @@ const DmenuUI = class {
                 label.remove_style_class_name('dmenu-result-hover');
                 label.add_style_class_name('dmenu-result-clicked');
                 this._selectedIndex = rowIndex;
-
                 GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
                     this._activate();
                     return GLib.SOURCE_REMOVE;
@@ -744,12 +718,14 @@ export default class SimpleDmenuExtension extends Extension {
 
         this._service = new DmenuService(this);
         this._service.export();
+
         this._ui = new DmenuUI(this._service);
     }
 
     disable() {
         this._ui?.hide();
         this._ui = null;
+
         this._service?.unexport();
         this._service = null;
     }
