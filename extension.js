@@ -84,32 +84,68 @@ class DmenuService {
      * second copy of the extension already owning the name) is logged
      * instead of throwing out of Extension.enable().
      */
+    // Inside your extension class
+
     export() {
-        try {
-            this._dbusImpl.export(Gio.DBus.session, OBJECT_PATH);
-        } catch (e) {
-            journal(`Failed to export D-Bus interface: ${e.message}`, true);
-            return;
+        // 1. Clean up any previous export (if any)
+        this._unexportInterface();
+
+        // 2. Release any previous bus‑name ownership
+        if (this._ownerId) {
+            Gio.bus_unown_name(this._ownerId);
+            this._ownerId = null;
         }
 
-        this._ownerId = Gio.DBus.session.own_name(
+        // 3. Request the bus name and export the interface
+        this._ownerId = Gio.bus_own_name(
+            Gio.BusType.SESSION,
             BUS_NAME,
             Gio.BusNameOwnerFlags.NONE,
-            (_connection, name) => journal(`${name}: name acquired`),
-            (_connection, name) =>
-                journal(`${name}: name lost — another instance may already own it`, true)
+            (connection) => {
+                // bus acquired – export the interface on this connection
+                try {
+                    this._dbusImpl.export(connection, OBJECT_PATH);
+                    journal(`D-Bus interface exported on ${OBJECT_PATH}`);
+                    this._exported = true;
+                } catch (e) {
+                    journal(`Failed to export D-Bus interface: ${e.message}`, true);
+                    this._exported = false;
+                }
+            },
+            (connection, name) => {
+                // name acquired
+                journal(`${name}: name acquired`);
+            },
+            (connection, name) => {
+                // name lost – clean up
+                journal(`${name}: name lost — another instance may already own it`, true);
+                this._unexportInterface();
+                this._ownerId = null;
+            }
         );
     }
 
     unexport() {
-        try {
-            this._dbusImpl.unexport();
-        } catch (e) {
-            journal(`Failed to unexport D-Bus interface: ${e.message}`, true);
-        }
+        // Release the bus name (this triggers the name‑lost callback, which calls _unexportInterface)
         if (this._ownerId) {
-            Gio.DBus.session.unown_name(this._ownerId);
+            Gio.bus_unown_name(this._ownerId);
             this._ownerId = null;
+        }
+        // Also directly unexport in case the name‑lost callback hasn't fired yet
+        this._unexportInterface();
+    }
+
+    _unexportInterface() {
+        // Idempotent cleanup: ignore "not exported" errors
+        try {
+            if (this._dbusImpl) {
+                this._dbusImpl.unexport();
+                this._exported = false;
+            }
+        } catch (e) {
+            if (!e.message.includes('not exported')) {
+                journal(`Failed to unexport D‑Bus interface: ${e.message}`, true);
+            }
         }
     }
 }
