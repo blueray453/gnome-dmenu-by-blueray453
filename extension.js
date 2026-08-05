@@ -108,7 +108,7 @@ class DmenuService {
             journal(`Failed to unexport D-Bus interface: ${e.message}`, true);
         }
         if (this._ownerId) {
-            Gio.DBus.session.bus_unown_name(this._ownerId);
+            Gio.DBus.session.unown_name(this._ownerId);
             this._ownerId = null;
         }
     }
