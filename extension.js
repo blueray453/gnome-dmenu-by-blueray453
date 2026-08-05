@@ -595,18 +595,21 @@ const DmenuUI = class {
             this._scrollStart = 0;
             return;
         }
-        const pageSize = this._itemsPerPage;
-        const buffer = Math.floor(pageSize / 4);
 
-        if (this._selectedIndex < this._scrollStart + buffer) {
-            this._scrollStart = Math.max(0, this._selectedIndex - buffer);
-        } else if (this._selectedIndex >= this._scrollStart + pageSize - buffer) {
-            this._scrollStart = Math.min(
-                Math.max(0, this._visibleItems.length - pageSize),
-                this._selectedIndex - pageSize + buffer + 1
-            );
+        const pageSize = this._itemsPerPage > 0 ? this._itemsPerPage : 10;
+
+        if (this._selectedIndex < this._scrollStart) {
+            // Selection moved above the visible window (Up key) —
+            // scroll so selected item becomes the first visible row.
+            this._scrollStart = this._selectedIndex;
+        } else if (this._selectedIndex >= this._scrollStart + pageSize) {
+            // Selection moved below the visible window (Down key) —
+            // scroll so selected item becomes the last visible row.
+            this._scrollStart = this._selectedIndex - pageSize + 1;
         }
-        this._scrollStart = Math.max(0, this._scrollStart);
+
+        const maxScrollStart = Math.max(0, this._visibleItems.length - pageSize);
+        this._scrollStart = Math.max(0, Math.min(this._scrollStart, maxScrollStart));
     }
 
     _render() {
