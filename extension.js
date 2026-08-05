@@ -188,8 +188,8 @@ const DmenuUI = class {
 
         this._allItems = [];
         this._visibleItems = [];
+        this._rowActors = [];
         this._selectedIndex = 0;
-        this._scrollStart = 0;
         this._selectedItems = new Set();
         this._filterTimeoutId = null;
         this._isOpen = false;
@@ -197,8 +197,7 @@ const DmenuUI = class {
         this._fullscreen = false;
         this._actionMode = 'stdin';
         this._filterTokens = [];
-
-        this._itemsPerPage = 10;
+        this._rowHeight = null; // cached uniform row height, measured lazily
     }
 
     // ---------- Public API ----------
@@ -320,9 +319,9 @@ const DmenuUI = class {
         }
         this.entry.set_text('');
         this._selectedIndex = 0;
-        this._scrollStart = 0;
         this._selectedItems.clear();
         this._filterTokens = [];
+        this._rowHeight = null; // re-measure against current stylesheet on each open
         this._isOpen = true;
 
         const monitor = Main.layoutManager.primaryMonitor;
@@ -341,11 +340,6 @@ const DmenuUI = class {
 
         Main.layoutManager.addChrome(this.actor, { affectsInputRegion: true });
 
-        // Now that the actor is parented (and has a real allocated width/height
-        // and access to the theme's stylesheet), measure how many rows
-        // actually fit instead of relying on a hardcoded constant.
-        this._itemsPerPage = this._computeItemsPerPage();
-
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
             if (this._isOpen) this.entry.grab_key_focus();
             return GLib.SOURCE_REMOVE;
@@ -363,16 +357,18 @@ const DmenuUI = class {
         Main.layoutManager.removeChrome(this.actor);
         this._isOpen = false;
         this._filterTokens = [];
+        this._rowActors = [];
     }
 
     /**
-     * Measures the natural height of a single result row using the live
-     * theme/stylesheet, by temporarily adding a throwaway probe row to
-     * results_box and reading its preferred height.
-     * Returns null if measurement isn't possible (e.g. no theme yet).
+     * Measures (and caches) the natural height of a single result row using
+     * the live theme/stylesheet, so we can compute scroll offsets without
+     * waiting for a full Clutter allocation pass. All rows share the same
+     * style classes, so a single measurement is valid for all of them.
      */
     _measureRowHeight() {
-        let rowHeight = null;
+        if (this._rowHeight) return this._rowHeight;
+
         try {
             const probeRow = new St.BoxLayout({
                 vertical: false,
@@ -389,46 +385,56 @@ const DmenuUI = class {
 
             probeRow.add_child(probeMarker);
             probeRow.add_child(probeLabel);
-
-            // Must be added to the stage-connected hierarchy for style
-            // resolution (fonts, padding) to be accurate.
             this.results_box.add_child(probeRow);
 
             const [, naturalHeight] = probeRow.get_preferred_height(-1);
-            rowHeight = naturalHeight;
 
             this.results_box.remove_child(probeRow);
             probeRow.destroy();
+
+            if (naturalHeight > 0) this._rowHeight = naturalHeight;
         } catch (e) {
             journal(`Row height measurement failed: ${e.message}`, true);
-            rowHeight = null;
         }
-        return rowHeight && rowHeight > 0 ? rowHeight : null;
+
+        return this._rowHeight;
     }
 
     /**
-     * Computes how many result rows fit in the current results_container,
-     * based on the actor's actual allocated height and the real row height
-     * from the current stylesheet. Falls back to the previous/default value
-     * if measurement isn't possible.
+     * Scrolls the native ScrollView so the currently selected row is fully
+     * visible. Because _render() now adds every visible item as a real
+     * child, the ScrollView's adjustment (and therefore its scrollbar)
+     * always reflects the true size/position of the full list — this just
+     * nudges the scroll position, it doesn't fake the scrollbar itself.
      */
-    _computeItemsPerPage() {
+    _scrollSelectedIntoView() {
+        if (this._rowActors.length === 0) return;
+
+        const adjustment = this.results_container.vadjustment;
+        if (!adjustment) return;
+
         const rowHeight = this._measureRowHeight();
-        if (!rowHeight) {
-            return this._itemsPerPage > 0 ? this._itemsPerPage : 10;
+        if (!rowHeight) return;
+
+        const containerHeight = adjustment.page_size > 0
+            ? adjustment.page_size
+            : this.results_container.height;
+        if (!containerHeight) return;
+
+        const rowTop = this._selectedIndex * rowHeight;
+        const rowBottom = rowTop + rowHeight;
+
+        let value = adjustment.value;
+        if (rowTop < value) {
+            value = rowTop;
+        } else if (rowBottom > value + containerHeight) {
+            value = rowBottom - containerHeight;
         }
 
-        const [, entryHeight] = this.entry.get_preferred_height(-1);
-        const totalHeight = this.actor.height > 0
-            ? this.actor.height
-            : Math.min(600, Main.layoutManager.primaryMonitor.height - 150);
+        const maxValue = Math.max(0, adjustment.upper - containerHeight);
+        value = Math.max(0, Math.min(value, maxValue));
 
-        // Leave a little slack for container padding/spacing between entry
-        // and results (defined in .dmenu-container padding/spacing).
-        const availableHeight = Math.max(0, totalHeight - entryHeight);
-        const perPage = Math.floor(availableHeight / rowHeight);
-
-        return Math.max(1, perPage);
+        adjustment.value = value;
     }
 
     _onTextChanged() {
@@ -437,7 +443,6 @@ const DmenuUI = class {
 
         this._filterTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FILTER_DEBOUNCE_MS, () => {
             this._selectedIndex = 0;
-            this._scrollStart = 0;
             this._updateResults();
             this._filterTimeoutId = null;
             return GLib.SOURCE_REMOVE;
@@ -457,7 +462,6 @@ const DmenuUI = class {
         if (sym === Clutter.KEY_Down) {
             if (this._visibleItems.length > 0) {
                 this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
-                this._updateScrollWindow();
                 this._render();
             }
             return Clutter.EVENT_STOP;
@@ -466,7 +470,6 @@ const DmenuUI = class {
         if (sym === Clutter.KEY_Up) {
             if (this._visibleItems.length > 0) {
                 this._selectedIndex = Math.max(0, this._selectedIndex - 1);
-                this._updateScrollWindow();
                 this._render();
             }
             return Clutter.EVENT_STOP;
@@ -477,7 +480,6 @@ const DmenuUI = class {
                 this._toggleCurrent();
                 if (this._visibleItems.length > 0)
                     this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
-                this._updateScrollWindow();
                 this._render();
                 return Clutter.EVENT_STOP;
             }
@@ -493,7 +495,6 @@ const DmenuUI = class {
                 this._toggleCurrent();
                 if (this._visibleItems.length > 0)
                     this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
-                this._updateScrollWindow();
                 this._render();
                 return Clutter.EVENT_STOP;
             }
@@ -586,38 +587,14 @@ const DmenuUI = class {
                 return tokens.every(tok => lower.includes(tok));
             });
 
-        this._updateScrollWindow();
         this._render();
-    }
-
-    _updateScrollWindow() {
-        if (this._visibleItems.length === 0) {
-            this._scrollStart = 0;
-            return;
-        }
-
-        const pageSize = this._itemsPerPage > 0 ? this._itemsPerPage : 10;
-
-        if (this._selectedIndex < this._scrollStart) {
-            // Selection moved above the visible window (Up key) —
-            // scroll so selected item becomes the first visible row.
-            this._scrollStart = this._selectedIndex;
-        } else if (this._selectedIndex >= this._scrollStart + pageSize) {
-            // Selection moved below the visible window (Down key) —
-            // scroll so selected item becomes the last visible row.
-            this._scrollStart = this._selectedIndex - pageSize + 1;
-        }
-
-        const maxScrollStart = Math.max(0, this._visibleItems.length - pageSize);
-        this._scrollStart = Math.max(0, Math.min(this._scrollStart, maxScrollStart));
     }
 
     _render() {
         this.results_box.remove_all_children();
+        this._rowActors = [];
 
-        const pageSize = this._itemsPerPage;
-        const end = Math.min(this._scrollStart + pageSize, this._visibleItems.length);
-        for (let i = this._scrollStart; i < end; i++) {
+        for (let i = 0; i < this._visibleItems.length; i++) {
             const item = this._visibleItems[i];
             const row = new St.BoxLayout({
                 vertical: false,
@@ -683,7 +660,10 @@ const DmenuUI = class {
             });
 
             this.results_box.add_child(row);
+            this._rowActors.push(row);
         }
+
+        this._scrollSelectedIntoView();
     }
 };
 
