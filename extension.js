@@ -45,7 +45,6 @@ const DBUS_INTERFACE = `
   </interface>
 </node>`;
 
-const ITEMS_PER_PAGE = 10;
 const FILTER_DEBOUNCE_MS = 150;
 
 class DmenuService {
@@ -198,6 +197,8 @@ const DmenuUI = class {
         this._fullscreen = false;
         this._actionMode = 'stdin';
         this._filterTokens = [];
+
+        this._itemsPerPage = 10;
     }
 
     // ---------- Public API ----------
@@ -340,6 +341,11 @@ const DmenuUI = class {
 
         Main.layoutManager.addChrome(this.actor, { affectsInputRegion: true });
 
+        // Now that the actor is parented (and has a real allocated width/height
+        // and access to the theme's stylesheet), measure how many rows
+        // actually fit instead of relying on a hardcoded constant.
+        this._itemsPerPage = this._computeItemsPerPage();
+
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
             if (this._isOpen) this.entry.grab_key_focus();
             return GLib.SOURCE_REMOVE;
@@ -357,6 +363,72 @@ const DmenuUI = class {
         Main.layoutManager.removeChrome(this.actor);
         this._isOpen = false;
         this._filterTokens = [];
+    }
+
+    /**
+     * Measures the natural height of a single result row using the live
+     * theme/stylesheet, by temporarily adding a throwaway probe row to
+     * results_box and reading its preferred height.
+     * Returns null if measurement isn't possible (e.g. no theme yet).
+     */
+    _measureRowHeight() {
+        let rowHeight = null;
+        try {
+            const probeRow = new St.BoxLayout({
+                vertical: false,
+                style_class: 'dmenu-result-row',
+            });
+            const probeMarker = new St.Label({
+                text: '●',
+                style_class: 'dmenu-marker',
+            });
+            const probeLabel = new St.Label({
+                style_class: 'dmenu-result',
+            });
+            probeLabel.clutter_text.set_text('Probe row for height measurement');
+
+            probeRow.add_child(probeMarker);
+            probeRow.add_child(probeLabel);
+
+            // Must be added to the stage-connected hierarchy for style
+            // resolution (fonts, padding) to be accurate.
+            this.results_box.add_child(probeRow);
+
+            const [, naturalHeight] = probeRow.get_preferred_height(-1);
+            rowHeight = naturalHeight;
+
+            this.results_box.remove_child(probeRow);
+            probeRow.destroy();
+        } catch (e) {
+            journal(`Row height measurement failed: ${e.message}`, true);
+            rowHeight = null;
+        }
+        return rowHeight && rowHeight > 0 ? rowHeight : null;
+    }
+
+    /**
+     * Computes how many result rows fit in the current results_container,
+     * based on the actor's actual allocated height and the real row height
+     * from the current stylesheet. Falls back to the previous/default value
+     * if measurement isn't possible.
+     */
+    _computeItemsPerPage() {
+        const rowHeight = this._measureRowHeight();
+        if (!rowHeight) {
+            return this._itemsPerPage > 0 ? this._itemsPerPage : 10;
+        }
+
+        const [, entryHeight] = this.entry.get_preferred_height(-1);
+        const totalHeight = this.actor.height > 0
+            ? this.actor.height
+            : Math.min(600, Main.layoutManager.primaryMonitor.height - 150);
+
+        // Leave a little slack for container padding/spacing between entry
+        // and results (defined in .dmenu-container padding/spacing).
+        const availableHeight = Math.max(0, totalHeight - entryHeight);
+        const perPage = Math.floor(availableHeight / rowHeight);
+
+        return Math.max(1, perPage);
     }
 
     _onTextChanged() {
@@ -523,14 +595,15 @@ const DmenuUI = class {
             this._scrollStart = 0;
             return;
         }
-        const buffer = Math.floor(ITEMS_PER_PAGE / 4);
+        const pageSize = this._itemsPerPage;
+        const buffer = Math.floor(pageSize / 4);
 
         if (this._selectedIndex < this._scrollStart + buffer) {
             this._scrollStart = Math.max(0, this._selectedIndex - buffer);
-        } else if (this._selectedIndex >= this._scrollStart + ITEMS_PER_PAGE - buffer) {
+        } else if (this._selectedIndex >= this._scrollStart + pageSize - buffer) {
             this._scrollStart = Math.min(
-                Math.max(0, this._visibleItems.length - ITEMS_PER_PAGE),
-                this._selectedIndex - ITEMS_PER_PAGE + buffer + 1
+                Math.max(0, this._visibleItems.length - pageSize),
+                this._selectedIndex - pageSize + buffer + 1
             );
         }
         this._scrollStart = Math.max(0, this._scrollStart);
@@ -539,7 +612,8 @@ const DmenuUI = class {
     _render() {
         this.results_box.remove_all_children();
 
-        const end = Math.min(this._scrollStart + ITEMS_PER_PAGE, this._visibleItems.length);
+        const pageSize = this._itemsPerPage;
+        const end = Math.min(this._scrollStart + pageSize, this._visibleItems.length);
         for (let i = this._scrollStart; i < end; i++) {
             const item = this._visibleItems[i];
             const row = new St.BoxLayout({
