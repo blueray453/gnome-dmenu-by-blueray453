@@ -51,6 +51,7 @@ class DmenuService {
     constructor(extension) {
         this._extension = extension;
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_INTERFACE, this);
+        this._ownerId = null;
     }
 
     Show(items, multi, hint, fullscreen) {
@@ -77,14 +78,35 @@ class DmenuService {
         this._dbusImpl.emit_signal('Cancelled', null);
     }
 
+    /**
+     * Exports the interface on the session bus and requests ownership of
+     * the well‑known name. Both steps are guarded: a failure here (e.g. a
+     * second copy of the extension already owning the name) is logged
+     * instead of throwing out of Extension.enable().
+     */
     export() {
-        this._dbusImpl.export(Gio.DBus.session, OBJECT_PATH);
+        try {
+            this._dbusImpl.export(Gio.DBus.session, OBJECT_PATH);
+        } catch (e) {
+            journal(`Failed to export D-Bus interface: ${e.message}`, true);
+            return;
+        }
+
         this._ownerId = Gio.DBus.session.own_name(
-            BUS_NAME, Gio.BusNameOwnerFlags.NONE, null, null);
+            BUS_NAME,
+            Gio.BusNameOwnerFlags.NONE,
+            (_connection, name) => journal(`${name}: name acquired`),
+            (_connection, name) =>
+                journal(`${name}: name lost — another instance may already own it`, true)
+        );
     }
 
     unexport() {
-        this._dbusImpl.unexport();
+        try {
+            this._dbusImpl.unexport();
+        } catch (e) {
+            journal(`Failed to unexport D-Bus interface: ${e.message}`, true);
+        }
         if (this._ownerId) {
             Gio.DBus.session.unown_name(this._ownerId);
             this._ownerId = null;

@@ -9,7 +9,44 @@ try { GioUnix = imports.gi.GioUnix; } catch (e) { GioUnix = null; }
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
-const INTERFACE_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
+
+const DBUS_INTERFACE = `
+<node>
+  <interface name="org.gnome.Shell.Extensions.SimpleDmenu">
+    <method name="Show">
+      <arg type="as" name="items" direction="in"/>
+      <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
+    </method>
+    <method name="ShowApps">
+      <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
+    </method>
+    <method name="ShowWindows">
+      <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
+    </method>
+    <method name="ShowPaths">
+      <arg type="as" name="paths" direction="in"/>
+      <arg type="b" name="multi" direction="in"/>
+      <arg type="s" name="hint" direction="in"/>
+      <arg type="b" name="fullscreen" direction="in"/>
+    </method>
+    <signal name="Selected">
+      <arg type="as" name="items"/>
+    </signal>
+    <signal name="Cancelled"/>
+  </interface>
+</node>`;
+
+// High-level proxy wrapper generated from the interface XML above. This
+// gives us typed *Sync methods (no manual GVariant packing) and
+// connectSignal()/disconnectSignal() that are scoped to this proxy's
+// connection, rather than a raw bus-wide signal_subscribe().
+const DmenuProxy = Gio.DBusProxy.makeProxyWrapper(DBUS_INTERFACE);
 
 function readStdinLines() {
     const unixStream = GioUnix
@@ -93,90 +130,55 @@ function main() {
     const loop = GLib.MainLoop.new(null, false);
     let result = null;
 
-    let bus;
-    try {
-        bus = Gio.bus_get_sync(Gio.BusType.SESSION, null);
-    } catch (e) {
-        printerr(`gdmenu: could not connect to session bus: ${e.message}`);
-        System.exit(2);
-    }
-
-    bus.signal_subscribe(
-        null, INTERFACE_NAME, 'Selected', OBJECT_PATH, null,
-        Gio.DBusSignalFlags.NONE,
-        (conn, sender, path, iface, signal, params) => {
-            result = params.deepUnpack()[0];
-            loop.quit();
-        }
-    );
-
-    bus.signal_subscribe(
-        null, INTERFACE_NAME, 'Cancelled', OBJECT_PATH, null,
-        Gio.DBusSignalFlags.NONE,
-        () => {
-            result = null;
-            loop.quit();
-        }
-    );
-
+    // Construct the proxy on the session bus. Gio.DBus.session is already
+    // a connected Gio.DBusConnection, so there's no need to acquire one
+    // manually with Gio.bus_get_sync().
     let proxy;
     try {
-        proxy = Gio.DBusProxy.new_for_bus_sync(
-            Gio.BusType.SESSION,
-            Gio.DBusProxyFlags.NONE,
-            null,
-            BUS_NAME,
-            OBJECT_PATH,
-            INTERFACE_NAME,
-            null
-        );
+        proxy = DmenuProxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH);
     } catch (e) {
+        if (e instanceof Gio.DBusError)
+            Gio.DBusError.strip_remote_error(e);
         printerr(`gdmenu: could not reach extension: ${e.message}`);
         printerr('gdmenu: is the simple-dmenu GNOME Shell extension enabled?');
         System.exit(2);
     }
 
+    // connectSignal() scopes the subscription to this proxy's connection
+    // (BUS_NAME's current owner), unlike a raw signal_subscribe(sender: null)
+    // which would match a signal of this name/path/interface from ANY
+    // process on the bus.
+    const selectedId = proxy.connectSignal('Selected', (_proxy, _sender, args) => {
+        result = args[0];
+        loop.quit();
+    });
+    const cancelledId = proxy.connectSignal('Cancelled', () => {
+        result = null;
+        loop.quit();
+    });
+
     try {
         if (mode === 'drun') {
-            proxy.call_sync(
-                'ShowApps',
-                new GLib.Variant('(bsb)', [multi, hint, fullscreen]),
-                Gio.DBusCallFlags.NONE,
-                -1,
-                null
-            );
+            proxy.ShowAppsSync(multi, hint, fullscreen);
         } else if (mode === 'window') {
-            proxy.call_sync(
-                'ShowWindows',
-                new GLib.Variant('(bsb)', [multi, hint, fullscreen]),
-                Gio.DBusCallFlags.NONE,
-                -1,
-                null
-            );
+            proxy.ShowWindowsSync(multi, hint, fullscreen);
         } else if (mode === 'paths') {
-            proxy.call_sync(
-                'ShowPaths',
-                new GLib.Variant('(asbsb)', [lines, multi, hint, fullscreen]),
-                Gio.DBusCallFlags.NONE,
-                -1,
-                null
-            );
+            proxy.ShowPathsSync(lines, multi, hint, fullscreen);
         } else {
             // stdin mode
-            proxy.call_sync(
-                'Show',
-                new GLib.Variant('(asbsb)', [lines, multi, hint, fullscreen]),
-                Gio.DBusCallFlags.NONE,
-                -1,
-                null
-            );
+            proxy.ShowSync(lines, multi, hint, fullscreen);
         }
     } catch (e) {
+        if (e instanceof Gio.DBusError)
+            Gio.DBusError.strip_remote_error(e);
         printerr(`gdmenu: D‑Bus call failed: ${e.message}`);
         System.exit(2);
     }
 
     loop.run();
+
+    proxy.disconnectSignal(selectedId);
+    proxy.disconnectSignal(cancelledId);
 
     if (result && result.length > 0) {
         for (const item of result) {
