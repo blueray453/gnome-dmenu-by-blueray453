@@ -9,6 +9,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { setLogging, setLogFn, journal } from './utils.js';
 
 const SPEC_CACHE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.cache', 'gnome-dbus-spec']);
+const SPEC_CACHE_FILE = 'simple-dmenu.json'; // Fixed filename
+
 const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
 
@@ -828,32 +830,40 @@ const DmenuUI = class {
 };
 
 export default class SimpleDmenuExtension extends Extension {
-    _writeSpecCache(busName, interfaces) {
+    // No arguments needed! Uses module constants directly.
+    _writeSpecCache() {
         try {
             GLib.mkdir_with_parents(SPEC_CACHE_DIR, 0o755);
+
+            // Flat structure: only what the client needs to build the proxy
             const spec = {
-                bus_name: busName,
-                generated_at: new Date().toISOString(),
-                interfaces,
+                bus_name: BUS_NAME,
+                object_path: OBJECT_PATH,
+                xml: DBUS_INTERFACE,
             };
-            const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, `${busName}.json`]);
+
+            const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, SPEC_CACHE_FILE]);
             GLib.file_set_contents(filePath, JSON.stringify(spec, null, 2));
+            journal(`Wrote spec cache to ${filePath}`);
         } catch (e) {
-            console.error(`[SimpleDmenu] failed to write spec cache: ${e.message}`);
+            journal(`Failed to write spec cache: ${e.message}`, true);
         }
     }
 
-    _removeSpecCache(busName) {
+    // No arguments needed!
+    _removeSpecCache() {
         try {
-            const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, `${busName}.json`]);
+            const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, SPEC_CACHE_FILE]);
             const file = Gio.File.new_for_path(filePath);
             if (file.query_exists(null)) {
                 file.delete(null);
+                journal(`Removed spec cache`);
             }
         } catch (e) {
-            console.error(`[SimpleDmenu] failed to remove spec cache: ${e.message}`);
+            journal(`Failed to remove spec cache: ${e.message}`, true);
         }
     }
+
     enable() {
         setLogFn((msg, error = false) => {
             const level = error
@@ -879,12 +889,7 @@ export default class SimpleDmenuExtension extends Extension {
 
         this._ui = new DmenuUI(this._service);
 
-        this._writeSpecCache(BUS_NAME, {
-            'org.gnome.Shell.Extensions.SimpleDmenu': {
-                object_path: '/org/gnome/Shell/Extensions/SimpleDmenu',
-                xml: DBUS_INTERFACE,
-            },
-        });
+        this._writeSpecCache();
     }
 
     disable() {
@@ -894,7 +899,7 @@ export default class SimpleDmenuExtension extends Extension {
         this._service?.unexport();
         this._service = null;
 
-        this._removeSpecCache(BUS_NAME);
+        this._removeSpecCache();
     }
 
     show(items, multi = false, hint = null, fullscreen = false) {

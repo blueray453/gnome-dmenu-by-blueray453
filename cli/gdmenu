@@ -7,9 +7,9 @@ const System = imports.system;
 let GioUnix;
 try { GioUnix = imports.gi.GioUnix; } catch (e) { GioUnix = null; }
 
-const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
-const INTERFACE_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
-const SPEC_CACHE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.cache', 'gnome-dbus-spec']);
+const SPEC_CACHE_FILE = GLib.build_filenamev([
+    GLib.get_home_dir(), '.cache', 'gnome-dbus-spec', 'simple-dmenu.json'
+]);
 
 function showHelp() {
     print(`
@@ -35,12 +35,9 @@ Options:
 // No cache  => extension is not enabled. No introspection fallback.
 // ----------------------------------------------------------------------
 function getProxy() {
-    const specPath = GLib.build_filenamev([SPEC_CACHE_DIR, `${BUS_NAME}.json`]);
-    const file = Gio.File.new_for_path(specPath);
-
+    const file = Gio.File.new_for_path(SPEC_CACHE_FILE);
     if (!file.query_exists(null)) {
         printerr('gdmenu: simple-dmenu extension is not enabled');
-        printerr('gdmenu: enable the extension and try again');
         System.exit(2);
     }
 
@@ -49,24 +46,23 @@ function getProxy() {
         const [ok, contents] = file.load_contents(null);
         spec = JSON.parse(new TextDecoder().decode(contents));
     } catch (e) {
-        printerr(`gdmenu: could not read interface cache: ${e.message}`);
+        printerr('gdmenu: failed to read cache');
         System.exit(2);
     }
 
-    const iface = spec.interfaces?.[INTERFACE_NAME];
-    if (!iface || !iface.xml) {
-        printerr(`gdmenu: interface "${INTERFACE_NAME}" missing from cache`);
+    // Validate that the required fields exist
+    if (!spec.xml || !spec.bus_name || !spec.object_path) {
+        printerr('gdmenu: cache is malformed');
         System.exit(2);
     }
 
     try {
-        const ProxyClass = Gio.DBusProxy.makeProxyWrapper(iface.xml);
-        return new ProxyClass(Gio.DBus.session, spec.bus_name, iface.object_path);
+        // Build proxy entirely from cache data
+        const ProxyClass = Gio.DBusProxy.makeProxyWrapper(spec.xml);
+        return new ProxyClass(Gio.DBus.session, spec.bus_name, spec.object_path);
     } catch (e) {
-        if (e instanceof Gio.DBusError)
-            Gio.DBusError.strip_remote_error(e);
+        if (e instanceof Gio.DBusError) Gio.DBusError.strip_remote_error(e);
         printerr(`gdmenu: could not reach extension: ${e.message}`);
-        printerr('gdmenu: the cache may be stale — re-enable the extension');
         System.exit(2);
     }
 }
