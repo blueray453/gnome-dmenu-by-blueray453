@@ -11,11 +11,11 @@ import { setLogging, setLogFn, journal } from './utils.js';
 const SPEC_CACHE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.cache', 'gnome-dbus-spec']);
 const SPEC_CACHE_FILE = 'simple-dmenu.json'; // Fixed filename
 
-const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
-const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
+const BUS_NAME = 'io.github.blueray453.SimpleDmenu';
+const OBJECT_PATH = '/io/github/blueray453/SimpleDmenu';
 
 const DBUS_INTERFACE = `<node>
-  <interface name="org.gnome.Shell.Extensions.SimpleDmenu">
+  <interface name="io.github.blueray453.SimpleDmenu">
     <method name="Show">
       <arg type="as" name="items" direction="in"/>
       <arg type="b" name="multi" direction="in"/>
