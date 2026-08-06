@@ -864,6 +864,66 @@ export default class SimpleDmenuExtension extends Extension {
         }
     }
 
+    _installCli() {
+        // this.path is the absolute path to your extension directory (GNOME 45+)
+        const cliScript = GLib.build_filenamev([this.path, 'cli', 'gdmenu']);
+        const binDir = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin']);
+        const symlinkPath = GLib.build_filenamev([binDir, 'gdmenu']);
+
+        try {
+            // 1. Make the TARGET script executable (0o755 = rwxr-xr-x)
+            GLib.chmod(cliScript, 0o755);
+
+            // 2. Ensure ~/.local/bin exists
+            GLib.mkdir_with_parents(binDir, 0o755);
+
+            // 3. Create or update the symlink
+            const linkFile = Gio.File.new_for_path(symlinkPath);
+
+            if (linkFile.query_exists(null)) {
+                // Check if it already points to our script
+                const info = linkFile.query_info(
+                    Gio.FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
+                    Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                    null
+                );
+                if (info.get_symlink_target() !== cliScript) {
+                    linkFile.delete(null); // Delete old symlink pointing elsewhere
+                    linkFile.make_symbolic_link(cliScript, null);
+                    journal(`Updated CLI symlink: ${symlinkPath}`);
+                }
+            } else {
+                linkFile.make_symbolic_link(cliScript, null);
+                journal(`Created CLI symlink: ${symlinkPath}`);
+            }
+        } catch (e) {
+            journal(`Failed to setup CLI symlink: ${e.message}`, true);
+        }
+    }
+
+    _removeCliSymlink() {
+        const cliScript = GLib.build_filenamev([this.path, 'cli', 'gdmenu']);
+        const symlinkPath = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'gdmenu']);
+
+        try {
+            const linkFile = Gio.File.new_for_path(symlinkPath);
+            if (linkFile.query_exists(null)) {
+                const info = linkFile.query_info(
+                    Gio.FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
+                    Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                    null
+                );
+                // SAFETY: Only delete if it points to OUR script
+                if (info.get_symlink_target() === cliScript) {
+                    linkFile.delete(null);
+                    journal(`Removed CLI symlink`);
+                }
+            }
+        } catch (e) {
+            journal(`Failed to remove CLI symlink: ${e.message}`, true);
+        }
+    }
+
     enable() {
         setLogFn((msg, error = false) => {
             const level = error
@@ -889,6 +949,7 @@ export default class SimpleDmenuExtension extends Extension {
 
         this._ui = new DmenuUI(this._service);
 
+        this._installCli();
         this._writeSpecCache();
     }
 
@@ -899,6 +960,7 @@ export default class SimpleDmenuExtension extends Extension {
         this._service?.unexport();
         this._service = null;
 
+        this._removeCliSymlink();
         this._removeSpecCache();
     }
 
