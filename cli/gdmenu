@@ -8,9 +8,8 @@ let GioUnix;
 try { GioUnix = imports.gi.GioUnix; } catch (e) { GioUnix = null; }
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
-const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
 const INTERFACE_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
-const INTROSPECTABLE_INTERFACE = 'org.freedesktop.DBus.Introspectable';
+const SPEC_CACHE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.cache', 'gnome-dbus-spec']);
 
 function showHelp() {
     print(`
@@ -32,57 +31,43 @@ Options:
 }
 
 // ----------------------------------------------------------------------
-// Extract the specific <interface> block from the full introspection XML
+// Build the proxy from the spec cache written by the extension.
+// No cache  => extension is not enabled. No introspection fallback.
 // ----------------------------------------------------------------------
-function extractInterfaceXml(fullXml, interfaceName) {
-    const regex = new RegExp(`<interface\\s+name="${interfaceName}"[^>]*>[\\s\\S]*?</interface>`);
-    const match = fullXml.match(regex);
-    if (!match) {
-        throw new Error(`Interface "${interfaceName}" not found in introspection XML`);
-    }
-    // makeProxyWrapper requires a valid <node> wrapper around the interface
-    return `<node>\n${match[0]}\n</node>`;
-}
+function getProxy() {
+    const specPath = GLib.build_filenamev([SPEC_CACHE_DIR, `${BUS_NAME}.json`]);
+    const file = Gio.File.new_for_path(specPath);
 
-// ----------------------------------------------------------------------
-// Fetch XML via Introspect and create a Proxy dynamically
-// ----------------------------------------------------------------------
-function getProxy(busName, objectPath, interfaceName) {
-    let introProxy;
-    try {
-        introProxy = Gio.DBusProxy.new_for_bus_sync(
-            Gio.BusType.SESSION,
-            Gio.DBusProxyFlags.NONE,
-            null,
-            busName,
-            objectPath,
-            INTROSPECTABLE_INTERFACE,
-            null
-        );
-    } catch (e) {
-        throw new Error(`Could not create introspection proxy: ${e.message}`);
+    if (!file.query_exists(null)) {
+        printerr('gdmenu: simple-dmenu extension is not enabled');
+        printerr('gdmenu: enable the extension and try again');
+        System.exit(2);
     }
 
-    let fullXml;
+    let spec;
     try {
-        const result = introProxy.call_sync(
-            'Introspect',
-            null,
-            Gio.DBusCallFlags.NONE,
-            -1,
-            null
-        );
-        fullXml = result.deepUnpack()[0];
+        const [ok, contents] = file.load_contents(null);
+        spec = JSON.parse(new TextDecoder().decode(contents));
     } catch (e) {
-        throw new Error(`Introspect call failed: ${e.message}`);
+        printerr(`gdmenu: could not read interface cache: ${e.message}`);
+        System.exit(2);
+    }
+
+    const iface = spec.interfaces?.[INTERFACE_NAME];
+    if (!iface || !iface.xml) {
+        printerr(`gdmenu: interface "${INTERFACE_NAME}" missing from cache`);
+        System.exit(2);
     }
 
     try {
-        const ifaceXml = extractInterfaceXml(fullXml, interfaceName);
-        const ProxyClass = Gio.DBusProxy.makeProxyWrapper(ifaceXml);
-        return new ProxyClass(Gio.DBus.session, busName, objectPath);
+        const ProxyClass = Gio.DBusProxy.makeProxyWrapper(iface.xml);
+        return new ProxyClass(Gio.DBus.session, spec.bus_name, iface.object_path);
     } catch (e) {
-        throw new Error(`Failed to create proxy wrapper: ${e.message}`);
+        if (e instanceof Gio.DBusError)
+            Gio.DBusError.strip_remote_error(e);
+        printerr(`gdmenu: could not reach extension: ${e.message}`);
+        printerr('gdmenu: the cache may be stale — re-enable the extension');
+        System.exit(2);
     }
 }
 
@@ -149,17 +134,8 @@ function main() {
     const loop = GLib.MainLoop.new(null, false);
     let result = null;
 
-    // Construct the proxy dynamically via introspection
-    let proxy;
-    try {
-        proxy = getProxy(BUS_NAME, OBJECT_PATH, INTERFACE_NAME);
-    } catch (e) {
-        if (e instanceof Gio.DBusError)
-            Gio.DBusError.strip_remote_error(e);
-        printerr(`gdmenu: could not reach extension: ${e.message}`);
-        printerr('gdmenu: is the simple-dmenu GNOME Shell extension enabled?');
-        System.exit(2);
-    }
+    // Build proxy from the spec cache
+    const proxy = getProxy();
 
     // connectSignal() scopes the subscription to this proxy's connection
     const selectedId = proxy.connectSignal('Selected', (_proxy, _sender, args) => {
@@ -172,7 +148,6 @@ function main() {
     });
 
     try {
-        // No type strings anywhere — makeProxyWrapper handles packing automatically
         if (mode === 'drun') {
             proxy.ShowAppsSync(multi, hint, fullscreen);
         } else if (mode === 'window') {
