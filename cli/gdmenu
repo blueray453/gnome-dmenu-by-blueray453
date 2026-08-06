@@ -9,59 +9,8 @@ try { GioUnix = imports.gi.GioUnix; } catch (e) { GioUnix = null; }
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/SimpleDmenu';
-
-const DBUS_INTERFACE = `
-<node>
-  <interface name="org.gnome.Shell.Extensions.SimpleDmenu">
-    <method name="Show">
-      <arg type="as" name="items" direction="in"/>
-      <arg type="b" name="multi" direction="in"/>
-      <arg type="s" name="hint" direction="in"/>
-      <arg type="b" name="fullscreen" direction="in"/>
-    </method>
-    <method name="ShowApps">
-      <arg type="b" name="multi" direction="in"/>
-      <arg type="s" name="hint" direction="in"/>
-      <arg type="b" name="fullscreen" direction="in"/>
-    </method>
-    <method name="ShowWindows">
-      <arg type="b" name="multi" direction="in"/>
-      <arg type="s" name="hint" direction="in"/>
-      <arg type="b" name="fullscreen" direction="in"/>
-    </method>
-    <method name="ShowPaths">
-      <arg type="as" name="paths" direction="in"/>
-      <arg type="b" name="multi" direction="in"/>
-      <arg type="s" name="hint" direction="in"/>
-      <arg type="b" name="fullscreen" direction="in"/>
-    </method>
-    <signal name="Selected">
-      <arg type="as" name="items"/>
-    </signal>
-    <signal name="Cancelled"/>
-  </interface>
-</node>`;
-
-// High-level proxy wrapper generated from the interface XML above. This
-// gives us typed *Sync methods (no manual GVariant packing) and
-// connectSignal()/disconnectSignal() that are scoped to this proxy's
-// connection, rather than a raw bus-wide signal_subscribe().
-const DmenuProxy = Gio.DBusProxy.makeProxyWrapper(DBUS_INTERFACE);
-
-function readStdinLines() {
-    const unixStream = GioUnix
-        ? new GioUnix.InputStream({ fd: 0, close_fd: false })
-        : new Gio.UnixInputStream({ fd: 0, close_fd: false });
-    const dataStream = new Gio.DataInputStream({ base_stream: unixStream });
-
-    const lines = [];
-    while (true) {
-        const [line] = dataStream.read_line_utf8(null);
-        if (line === null) break;
-        if (line.length > 0) lines.push(line);
-    }
-    return lines;
-}
+const INTERFACE_NAME = 'org.gnome.Shell.Extensions.SimpleDmenu';
+const INTROSPECTABLE_INTERFACE = 'org.freedesktop.DBus.Introspectable';
 
 function showHelp() {
     print(`
@@ -82,8 +31,78 @@ Options:
 `);
 }
 
+// ----------------------------------------------------------------------
+// Extract the specific <interface> block from the full introspection XML
+// ----------------------------------------------------------------------
+function extractInterfaceXml(fullXml, interfaceName) {
+    const regex = new RegExp(`<interface\\s+name="${interfaceName}"[^>]*>[\\s\\S]*?</interface>`);
+    const match = fullXml.match(regex);
+    if (!match) {
+        throw new Error(`Interface "${interfaceName}" not found in introspection XML`);
+    }
+    // makeProxyWrapper requires a valid <node> wrapper around the interface
+    return `<node>\n${match[0]}\n</node>`;
+}
+
+// ----------------------------------------------------------------------
+// Fetch XML via Introspect and create a Proxy dynamically
+// ----------------------------------------------------------------------
+function getProxy(busName, objectPath, interfaceName) {
+    let introProxy;
+    try {
+        introProxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION,
+            Gio.DBusProxyFlags.NONE,
+            null,
+            busName,
+            objectPath,
+            INTROSPECTABLE_INTERFACE,
+            null
+        );
+    } catch (e) {
+        throw new Error(`Could not create introspection proxy: ${e.message}`);
+    }
+
+    let fullXml;
+    try {
+        const result = introProxy.call_sync(
+            'Introspect',
+            null,
+            Gio.DBusCallFlags.NONE,
+            -1,
+            null
+        );
+        fullXml = result.deepUnpack()[0];
+    } catch (e) {
+        throw new Error(`Introspect call failed: ${e.message}`);
+    }
+
+    try {
+        const ifaceXml = extractInterfaceXml(fullXml, interfaceName);
+        const ProxyClass = Gio.DBusProxy.makeProxyWrapper(ifaceXml);
+        return new ProxyClass(Gio.DBus.session, busName, objectPath);
+    } catch (e) {
+        throw new Error(`Failed to create proxy wrapper: ${e.message}`);
+    }
+}
+
+function readStdinLines() {
+    const unixStream = GioUnix
+        ? new GioUnix.InputStream({ fd: 0, close_fd: false })
+        : new Gio.UnixInputStream({ fd: 0, close_fd: false });
+    const dataStream = new Gio.DataInputStream({ base_stream: unixStream });
+
+    const lines = [];
+    while (true) {
+        const [line] = dataStream.read_line_utf8(null);
+        if (line === null) break;
+        if (line.length > 0) lines.push(line);
+    }
+    return lines;
+}
+
 function main() {
-    let mode = null;        // 'drun', 'window', 'paths', or null (stdin)
+    let mode = null;
     let multi = false;
     let hint = '';
     let fullscreen = false;
@@ -130,12 +149,10 @@ function main() {
     const loop = GLib.MainLoop.new(null, false);
     let result = null;
 
-    // Construct the proxy on the session bus. Gio.DBus.session is already
-    // a connected Gio.DBusConnection, so there's no need to acquire one
-    // manually with Gio.bus_get_sync().
+    // Construct the proxy dynamically via introspection
     let proxy;
     try {
-        proxy = DmenuProxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH);
+        proxy = getProxy(BUS_NAME, OBJECT_PATH, INTERFACE_NAME);
     } catch (e) {
         if (e instanceof Gio.DBusError)
             Gio.DBusError.strip_remote_error(e);
@@ -145,9 +162,6 @@ function main() {
     }
 
     // connectSignal() scopes the subscription to this proxy's connection
-    // (BUS_NAME's current owner), unlike a raw signal_subscribe(sender: null)
-    // which would match a signal of this name/path/interface from ANY
-    // process on the bus.
     const selectedId = proxy.connectSignal('Selected', (_proxy, _sender, args) => {
         result = args[0];
         loop.quit();
@@ -158,6 +172,7 @@ function main() {
     });
 
     try {
+        // No type strings anywhere — makeProxyWrapper handles packing automatically
         if (mode === 'drun') {
             proxy.ShowAppsSync(multi, hint, fullscreen);
         } else if (mode === 'window') {
