@@ -42,7 +42,10 @@ const DBUS_INTERFACE = `
   </interface>
 </node>`;
 
-// Proxy wrapper – gives us typed *Sync and *Async methods
+// High-level proxy wrapper generated from the interface XML above. This
+// gives us typed *Sync methods (no manual GVariant packing) and
+// connectSignal()/disconnectSignal() that are scoped to this proxy's
+// connection, rather than a raw bus-wide signal_subscribe().
 const DmenuProxy = Gio.DBusProxy.makeProxyWrapper(DBUS_INTERFACE);
 
 function readStdinLines() {
@@ -79,13 +82,12 @@ Options:
 `);
 }
 
-async function mainAsync() {
+function main() {
     let mode = null;        // 'drun', 'window', 'paths', or null (stdin)
     let multi = false;
     let hint = '';
     let fullscreen = false;
 
-    // Parse command line
     for (let i = 0; i < ARGV.length; i++) {
         const arg = ARGV[i];
         if (arg === '--help' || arg === '-h') {
@@ -125,11 +127,12 @@ async function mainAsync() {
         }
     }
 
-    // Main loop – we need it to wait for the signal
     const loop = GLib.MainLoop.new(null, false);
     let result = null;
 
-    // Create the proxy
+    // Construct the proxy on the session bus. Gio.DBus.session is already
+    // a connected Gio.DBusConnection, so there's no need to acquire one
+    // manually with Gio.bus_get_sync().
     let proxy;
     try {
         proxy = DmenuProxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH);
@@ -141,7 +144,10 @@ async function mainAsync() {
         System.exit(2);
     }
 
-    // Connect signals – these will quit the loop
+    // connectSignal() scopes the subscription to this proxy's connection
+    // (BUS_NAME's current owner), unlike a raw signal_subscribe(sender: null)
+    // which would match a signal of this name/path/interface from ANY
+    // process on the bus.
     const selectedId = proxy.connectSignal('Selected', (_proxy, _sender, args) => {
         result = args[0];
         loop.quit();
@@ -151,17 +157,16 @@ async function mainAsync() {
         loop.quit();
     });
 
-    // Make the D‑Bus call asynchronously
     try {
         if (mode === 'drun') {
-            await proxy.ShowAppsAsync(multi, hint, fullscreen);
+            proxy.ShowAppsSync(multi, hint, fullscreen);
         } else if (mode === 'window') {
-            await proxy.ShowWindowsAsync(multi, hint, fullscreen);
+            proxy.ShowWindowsSync(multi, hint, fullscreen);
         } else if (mode === 'paths') {
-            await proxy.ShowPathsAsync(lines, multi, hint, fullscreen);
+            proxy.ShowPathsSync(lines, multi, hint, fullscreen);
         } else {
             // stdin mode
-            await proxy.ShowAsync(lines, multi, hint, fullscreen);
+            proxy.ShowSync(lines, multi, hint, fullscreen);
         }
     } catch (e) {
         if (e instanceof Gio.DBusError)
@@ -170,14 +175,11 @@ async function mainAsync() {
         System.exit(2);
     }
 
-    // Wait for the user to select or cancel
     loop.run();
 
-    // Clean up signal handlers
     proxy.disconnectSignal(selectedId);
     proxy.disconnectSignal(cancelledId);
 
-    // Output result and exit
     if (result && result.length > 0) {
         for (const item of result) {
             print(item);
@@ -188,8 +190,4 @@ async function mainAsync() {
     }
 }
 
-// Entry point – run the async function and catch any unhandled errors
-mainAsync().catch(e => {
-    printerr(`gdmenu: uncaught error: ${e.message}`);
-    System.exit(2);
-});
+main();
