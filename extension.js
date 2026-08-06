@@ -51,7 +51,6 @@ const DBUS_INTERFACE = `<node>
 </node>`;
 
 const FILTER_DEBOUNCE_MS = 150;
-const SCROLL_TIME = 0.15;
 
 class DmenuService {
     constructor(extension) {
