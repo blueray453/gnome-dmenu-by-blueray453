@@ -146,6 +146,26 @@ class MenuItem {
 }
 
 // ============================================================
+// SHARED OPTIONS
+// ============================================================
+
+class DmenuOptions {
+    constructor({
+        multi = false,
+        hint = null,
+        fullscreen = false,
+    } = {}) {
+        this.multi = Boolean(multi);
+        this.hint = hint || null;
+        this.fullscreen = Boolean(fullscreen);
+    }
+
+    static from(multi = false, hint = null, fullscreen = false) {
+        return new DmenuOptions({ multi, hint, fullscreen });
+    }
+}
+
+// ============================================================
 // SEARCH MODEL
 // ============================================================
 
@@ -593,6 +613,15 @@ class WindowMode {
         this._controller = controller;
     }
 
+    getCapabilities() {
+        return {
+            multi: false,
+            hint: true,
+            fullscreen: false,
+            preview: true,
+        };
+    }
+
     getItems() {
         const windows = global.display.get_tab_list(
             Meta.TabList.NORMAL,
@@ -659,6 +688,15 @@ class DrunMode {
     constructor(controller) {
         this._controller = controller;
         this._favorites = AppFavorites.getAppFavorites();
+    }
+
+    getCapabilities() {
+        return {
+            multi: false,
+            hint: true,
+            fullscreen: true,
+            preview: false,
+        };
     }
 
     getItems() {
@@ -759,6 +797,15 @@ class PathMode {
         this._controller = controller;
     }
 
+    getCapabilities() {
+        return {
+            multi: true,
+            hint: true,
+            fullscreen: true,
+            preview: false,
+        };
+    }
+
     getItems(paths) {
         return paths.map(path => {
             let icon = null;
@@ -798,9 +845,18 @@ class PathMode {
 // GENERIC / STDIN MODE
 // ============================================================
 
-class CustomMode {
+class GenericMode {
     constructor(controller) {
         this._controller = controller;
+    }
+
+    getCapabilities() {
+        return {
+            multi: true,
+            hint: true,
+            fullscreen: true,
+            preview: false,
+        };
     }
 
     getItems(items) {
@@ -1290,9 +1346,9 @@ class DmenuController {
         this._windowMode = new WindowMode(this);
         this._drunMode = new DrunMode(this);
         this._pathMode = new PathMode(this);
-        this._customMode = new CustomMode(this);
+        this._genericMode = new GenericMode(this);
 
-        this._mode = this._customMode;
+        this._mode = this._genericMode;
         this._modeName = 'stdin';
 
         this._view = new DmenuView(this);
@@ -1324,46 +1380,46 @@ class DmenuController {
     }
 
     show(items, multi = false, hint = null, fullscreen = false) {
+        const options = DmenuOptions.from(multi, hint, fullscreen);
+
         this._open(
             'stdin',
-            this._customMode,
-            this._customMode.getItems(items),
-            multi,
-            hint,
-            fullscreen
+            this._genericMode,
+            this._genericMode.getItems(items),
+            options
         );
     }
 
     showApps(multi = false, hint = null, fullscreen = false) {
+        const options = DmenuOptions.from(multi, hint, fullscreen);
+
         this._open(
             'drun',
             this._drunMode,
             this._drunMode.getItems(),
-            multi,
-            hint,
-            fullscreen
+            options
         );
     }
 
     showWindows(multi = false, hint = null, fullscreen = false) {
+        const options = DmenuOptions.from(multi, hint, fullscreen);
+
         this._open(
             'window',
             this._windowMode,
             this._windowMode.getItems(),
-            multi,
-            hint,
-            fullscreen
+            options
         );
     }
 
     showPaths(paths, multi = false, hint = null, fullscreen = false) {
+        const options = DmenuOptions.from(multi, hint, fullscreen);
+
         this._open(
             'paths',
             this._pathMode,
             this._pathMode.getItems(paths),
-            multi,
-            hint,
-            fullscreen
+            options
         );
     }
 
@@ -1511,7 +1567,7 @@ class DmenuController {
                     .filter(value => value !== null && value !== undefined);
             } else {
                 resultLabels = selectedItems
-                    .map(item => this._customMode.activate(item))
+                    .map(item => this._genericMode.activate(item))
                     .filter(value => value !== null && value !== undefined);
             }
         } else if (this._view.getQuery()) {
@@ -1548,28 +1604,51 @@ class DmenuController {
         this._appMenu.openForApp(sourceActor, app);
     }
 
-    _open(modeName, mode, items, multi, hint, fullscreen) {
+    _open(modeName, mode, items, options) {
         if (this._isOpen)
             this._closeInternal();
 
+        const capabilities = {
+            multi: false,
+            hint: true,
+            fullscreen: true,
+            preview: false,
+            ...(typeof mode.getCapabilities === 'function'
+                ? mode.getCapabilities()
+                : {}),
+        };
+
+        const requested = options instanceof DmenuOptions
+            ? options
+            : new DmenuOptions(options);
+
+        // Unsupported mode options are intentionally ignored.
+        const effectiveOptions = new DmenuOptions({
+            multi: capabilities.multi ? requested.multi : false,
+            hint: capabilities.hint ? requested.hint : null,
+            fullscreen: capabilities.fullscreen ? requested.fullscreen : false,
+        });
+
         this._modeName = modeName;
         this._mode = mode;
-        this._multi = multi;
-        this._fullscreen = fullscreen;
+        this._multi = effectiveOptions.multi;
+        this._fullscreen = effectiveOptions.fullscreen;
         this._isOpen = true;
 
         this._search.setItems(items);
         this._selection.reset();
 
-        this._showPreview = modeName === 'window' && !fullscreen;
+        this._showPreview = Boolean(
+            capabilities.preview && !effectiveOptions.fullscreen
+        );
 
         this._view.cancelPendingWork();
         this._view.resetInput();
-        this._setHint(hint);
+        this._setHint(effectiveOptions.hint);
 
         const layout = this._view.configureLayout(
             this._showPreview,
-            fullscreen
+            effectiveOptions.fullscreen
         );
 
         this._previewWidth = layout.previewWidth;
