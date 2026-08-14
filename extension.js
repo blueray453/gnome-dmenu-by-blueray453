@@ -363,13 +363,25 @@ const DmenuUI = class {
         // Pinned apps are shown in the bar above the entry (dash-style), not
         // reordered within this list — they still appear here so search can
         // find them, tagged with `pinned` for the marker in the row.
-        const items = apps.map(a => ({
-            label: a.get_name(),
-            icon: a.get_icon(),
-            data: a,
-            id: a.get_id(),
-            pinned: favoriteIdSet.has(a.get_id()),
-        }));
+        const items = apps.map(a => {
+            let shellApp = null;
+
+            try {
+                if (appSystem && typeof appSystem.lookup_app === 'function')
+                    shellApp = appSystem.lookup_app(a.get_id());
+            } catch (e) {
+                journal(`Could not get Shell.App for ${a.get_id()}: ${e.message}`, true);
+            }
+
+            return {
+                label: a.get_name(),
+                icon: a.get_icon(),
+                data: a,
+                shellApp: shellApp,
+                id: a.get_id(),
+                pinned: favoriteIdSet.has(a.get_id()),
+            };
+        });
 
         this._actionMode = 'drun';
         this._appFavorites = appFavorites;
@@ -1021,12 +1033,19 @@ const DmenuUI = class {
                 const button = event.get_button();
 
                 if (button === Clutter.BUTTON_SECONDARY) {
-                    if (this._actionMode !== 'drun' || !(item.data instanceof Shell.App))
+                    if (this._actionMode !== 'drun')
                         return Clutter.EVENT_PROPAGATE;
+
+                    const app = item.shellApp;
+
+                    if (!app) {
+                        journal(`No Shell.App available for ${item.label}`, true);
+                        return Clutter.EVENT_STOP;
+                    }
 
                     this._closeOpenMenu();
 
-                    const menu = this._createAppMenu(row, item.data);
+                    const menu = this._createAppMenu(row, app);
                     this._openMenu = menu;
                     menu.open(true);
 
