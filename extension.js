@@ -6,6 +6,9 @@ import Shell from 'gi://Shell';
 import Meta from 'gi://Meta';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as AppFavorites from 'resource:///org/gnome/shell/ui/appFavorites.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import { AppMenu } from 'resource:///org/gnome/shell/ui/appMenu.js';
 import { setLogging, setLogFn, journal } from './utils.js';
 
 const SPEC_CACHE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.cache', 'gnome-dbus-spec']);
@@ -224,6 +227,14 @@ const DmenuUI = class {
             can_focus: true,
         });
 
+        // ---- Pinned apps bar (dash-style), shown above the search entry ----
+        this.pinned_bar = new St.BoxLayout({
+            style_class: 'dmenu-pinned-bar',
+            vertical: false,
+            x_expand: true,
+        });
+        this.pinned_bar.hide();
+
         this.entry = new St.Entry({
             style_class: 'dmenu-entry',
             hint_text: 'Type to filter · Enter: select · Tab: multi-select · Esc: cancel',
@@ -248,6 +259,7 @@ const DmenuUI = class {
 
         this.results_container.set_child(this.results_box);
 
+        this.actor.add_child(this.pinned_bar);
         this.actor.add_child(this.entry);
         this.actor.add_child(this.results_container);
 
@@ -273,6 +285,30 @@ const DmenuUI = class {
         this._fullscreen = false;
         this._actionMode = 'stdin';
         this._filterTokens = [];
+
+        // ---- Pin / context-menu state ----
+        this._appFavorites = null;
+        this._menuManager = new PopupMenu.PopupMenuManager(this.actor);
+        this._openMenu = null;
+
+        // Keep pinned bar + list ordering in sync with favorite changes made
+        // from anywhere: our own menu, Ctrl+P, or outside this popup entirely
+        // (e.g. Nautilus, the app grid).
+        AppFavorites.getAppFavorites().connectObject('changed', () => {
+            if (this._isOpen && this._actionMode === 'drun') {
+                this._refreshAppOrdering();
+                this._renderPinnedBar();
+            }
+        }, this.actor);
+
+        // // Super tap is often intercepted at the compositor level before it
+        // // reaches a focused actor's key-press-event, so handle it separately.
+        // global.display.connectObject('overlay-key', () => {
+        //     if (this._isOpen) {
+        //         this._service.emitCancelled();
+        //         this.hide();
+        //     }
+        // }, this.actor);
     }
 
     // ---------- Public API ----------
@@ -306,6 +342,7 @@ const DmenuUI = class {
         });
 
         this._actionMode = 'stdin';
+        this._appFavorites = null;
         this._showItems(itemObjects, multi, hint, fullscreen);
     }
 
@@ -320,14 +357,22 @@ const DmenuUI = class {
 
         apps.sort((a, b) => a.get_name().localeCompare(b.get_name()));
 
+        const appFavorites = AppFavorites.getAppFavorites();
+        const favoriteIdSet = new Set(appFavorites.getFavorites().map(a => a.get_id()));
+
+        // Pinned apps are shown in the bar above the entry (dash-style), not
+        // reordered within this list — they still appear here so search can
+        // find them, tagged with `pinned` for the marker in the row.
         const items = apps.map(a => ({
             label: a.get_name(),
             icon: a.get_icon(),
             data: a,
             id: a.get_id(),
+            pinned: favoriteIdSet.has(a.get_id()),
         }));
 
         this._actionMode = 'drun';
+        this._appFavorites = appFavorites;
         this._showItems(items, multi, hint, fullscreen);
     }
 
@@ -357,6 +402,7 @@ const DmenuUI = class {
         });
 
         this._actionMode = 'window';
+        this._appFavorites = null;
         this._showItems(items, multi, hint, fullscreen);
     }
 
@@ -391,6 +437,7 @@ const DmenuUI = class {
         });
 
         this._actionMode = 'paths';
+        this._appFavorites = null;
         this._showItems(items, multi, hint, fullscreen);
     }
 
@@ -415,6 +462,8 @@ const DmenuUI = class {
 
         if (hint) {
             this.entry.set_hint_text(hint);
+        } else if (this._actionMode === 'drun') {
+            this.entry.set_hint_text('Type to filter · Enter: launch · Ctrl+P: pin/unpin · Super/Esc: cancel');
         } else if (multi) {
             this.entry.set_hint_text('Type to filter · Enter: select · Tab: multi-select · Esc: cancel');
         } else {
@@ -426,6 +475,8 @@ const DmenuUI = class {
         this._selectedItems.clear();
         this._filterTokens = [];
         this._isOpen = true;
+
+        this._renderPinnedBar();
 
         const monitor = Main.layoutManager.primaryMonitor;
 
@@ -465,8 +516,13 @@ const DmenuUI = class {
             this._scrollIdleId = null;
         }
 
+        this._closeOpenMenu();
+
         if (!this._isOpen)
             return;
+
+        this.pinned_bar.hide();
+        this.pinned_bar.remove_all_children();
 
         Main.layoutManager.removeChrome(this.actor);
         this._isOpen = false;
@@ -579,6 +635,7 @@ const DmenuUI = class {
             GLib.source_remove(this._filterTimeoutId);
 
         this._filterTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FILTER_DEBOUNCE_MS, () => {
+            this._closeOpenMenu();
             this._selectedIndex = 0;
             this._updateResults();
             this._filterTimeoutId = null;
@@ -599,6 +656,7 @@ const DmenuUI = class {
 
         if (sym === Clutter.KEY_Down) {
             if (this._visibleItems.length > 0) {
+                this._closeOpenMenu();
                 this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
                 this._render();
             }
@@ -607,9 +665,16 @@ const DmenuUI = class {
 
         if (sym === Clutter.KEY_Up) {
             if (this._visibleItems.length > 0) {
+                this._closeOpenMenu();
                 this._selectedIndex = Math.max(0, this._selectedIndex - 1);
                 this._render();
             }
+            return Clutter.EVENT_STOP;
+        }
+
+        if (this._actionMode === 'drun' && sym === Clutter.KEY_p &&
+            (mods & Clutter.ModifierType.CONTROL_MASK)) {
+            this._togglePinCurrent();
             return Clutter.EVENT_STOP;
         }
 
@@ -660,6 +725,142 @@ const DmenuUI = class {
         else
             this._selectedItems.add(id);
     }
+
+    // ---------- Pin / favorites ----------
+
+    _togglePinCurrent() {
+        if (this._actionMode !== 'drun')
+            return;
+
+        if (this._visibleItems.length === 0 || this._selectedIndex >= this._visibleItems.length)
+            return;
+
+        const item = this._visibleItems[this._selectedIndex];
+        const favorites = AppFavorites.getAppFavorites();
+
+        if (favorites.isFavorite(item.id))
+            favorites.removeFavorite(item.id);
+        else
+            favorites.addFavorite(item.id);
+
+        // The favorites 'changed' listener wired up in the constructor
+        // takes care of re-rendering the bar and refreshing pinned flags.
+    }
+
+    /**
+     * Refreshes each item's `pinned` flag against the current favorites list.
+     * Does not reorder `_allItems` — pinned apps live in the bar, not in the
+     * scrollable list — but keeps rows' pin markers correct.
+     */
+    _refreshAppOrdering() {
+        if (this._actionMode !== 'drun' || !this._appFavorites)
+            return;
+
+        const keepId = this._visibleItems[this._selectedIndex]
+            ? this._visibleItems[this._selectedIndex].id
+            : null;
+
+        const favoriteIdSet = new Set(this._appFavorites.getFavorites().map(a => a.get_id()));
+
+        for (const item of this._allItems)
+            item.pinned = favoriteIdSet.has(item.id);
+
+        this._updateResults();
+
+        if (keepId) {
+            const idx = this._visibleItems.findIndex(i => i.id === keepId);
+            this._selectedIndex = idx !== -1 ? idx : 0;
+        }
+
+        this._render();
+    }
+
+    _renderPinnedBar() {
+        this.pinned_bar.remove_all_children();
+
+        if (this._actionMode !== 'drun' || !this._appFavorites) {
+            this.pinned_bar.hide();
+            return;
+        }
+
+        const favorites = this._appFavorites.getFavorites();
+        if (favorites.length === 0) {
+            this.pinned_bar.hide();
+            return;
+        }
+
+        this.pinned_bar.show();
+
+        for (const app of favorites) {
+            const button = new St.Button({
+                style_class: 'dmenu-pinned-icon',
+                child: new St.Icon({ gicon: app.get_icon(), icon_size: 48 }),
+                reactive: true,
+                can_focus: true,
+                track_hover: true,
+            });
+
+            button.connect('clicked', () => this._launchPinnedApp(app));
+
+            button.connect('button-press-event', (actor, event) => {
+                if (event.get_button() === Clutter.BUTTON_SECONDARY) {
+                    this._closeOpenMenu();
+                    const menu = this._createAppMenu(button, app);
+                    this._openMenu = menu;
+                    menu.open(true);
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            this.pinned_bar.add_child(button);
+        }
+    }
+
+    _launchPinnedApp(app) {
+        try {
+            app.launch([], null);
+        } catch (e) {
+            journal(`Failed to launch ${app.get_name()}: ${e.message}`, true);
+        }
+
+        this._service.emitSelected([app.get_name()]);
+        this.hide();
+    }
+
+    // ---------- Context menu (New Window / Pin / Details / Open Windows) ----------
+
+    _closeOpenMenu() {
+        if (this._openMenu) {
+            this._openMenu.close();
+            this._openMenu = null;
+        }
+    }
+
+    _createAppMenu(sourceActor, app) {
+        const menu = new AppMenu(sourceActor, St.Side.BOTTOM, {
+            favoritesSection: true,
+            showSingleWindows: true,
+        });
+
+        Main.layoutManager.addChrome(menu.actor);
+        menu.actor.hide();
+        this._menuManager.addMenu(menu);
+
+        menu.setApp(app);
+
+        menu.connect('open-state-changed', (o, isOpen) => {
+            if (!isOpen) {
+                if (menu === this._openMenu)
+                    this._openMenu = null;
+                menu.destroy();
+            }
+        });
+
+        return menu;
+    }
+
+    // ---------- Activation ----------
 
     _activate() {
         let resultLabels = [];
@@ -766,6 +967,12 @@ const DmenuUI = class {
                 y_align: Clutter.ActorAlign.CENTER,
             });
 
+            const pinMarker = new St.Label({
+                text: (this._actionMode === 'drun' && item.pinned) ? '📌' : '',
+                style_class: 'dmenu-pin-marker',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
             let iconActor = null;
             if (item.icon) {
                 iconActor = new St.Icon({
@@ -789,6 +996,7 @@ const DmenuUI = class {
             label.clutter_text.set_markup(markup);
 
             row.add_child(marker);
+            row.add_child(pinMarker);
 
             if (iconActor)
                 row.add_child(iconActor);
@@ -807,17 +1015,36 @@ const DmenuUI = class {
 
             const rowIndex = i;
 
-            row.connect('button-press-event', () => {
-                label.remove_style_class_name('dmenu-result-hover');
-                label.add_style_class_name('dmenu-result-clicked');
-                this._selectedIndex = rowIndex;
+            row.connect('button-press-event', (actor, event) => {
+                const button = event.get_button();
 
-                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-                    this._activate();
-                    return GLib.SOURCE_REMOVE;
-                });
+                if (button === Clutter.BUTTON_SECONDARY) {
+                    if (this._actionMode !== 'drun' || !(item.data instanceof Shell.App))
+                        return Clutter.EVENT_PROPAGATE;
 
-                return Clutter.EVENT_STOP;
+                    this._closeOpenMenu();
+
+                    const menu = this._createAppMenu(row, item.data);
+                    this._openMenu = menu;
+                    menu.open(true);
+
+                    return Clutter.EVENT_STOP;
+                }
+
+                if (button === Clutter.BUTTON_PRIMARY) {
+                    label.remove_style_class_name('dmenu-result-hover');
+                    label.add_style_class_name('dmenu-result-clicked');
+                    this._selectedIndex = rowIndex;
+
+                    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                        this._activate();
+                        return GLib.SOURCE_REMOVE;
+                    });
+
+                    return Clutter.EVENT_STOP;
+                }
+
+                return Clutter.EVENT_PROPAGATE;
             });
 
             this.results_box.add_child(row);
