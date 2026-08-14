@@ -146,3 +146,37 @@
     border-radius: 8px;
     margin: 4px;
 }
+
+.dmenu-left-box {
+    spacing: 12px;
+}
+
+.dmenu-results-box {
+    spacing: 4px;
+}
+
+.window-preview-title {
+    font-size: 32px;
+    font-weight: bold;
+    color: #fdf6e3; /* Solarized base3, matches selected-row text */
+    background-color: rgba(0, 0, 0, 0.55);
+    padding: 8px 16px;
+    border-radius: 6px;
+}
+
+.window-close-button {
+    background-color: rgba(0, 43, 54, 0.75); /* Solarized base03 */
+    border: 1px solid #586e75; /* Solarized base01 */
+    border-radius: 24px;
+    color: #eee8d5; /* Solarized base2 */
+    icon-size: 32px;
+}
+
+.window-close-button:hover {
+    background-color: rgba(220, 50, 47, 0.75); /* Solarized red */
+    border-color: #dc322f;
+}
+
+.window-close-button:active {
+    background-color: rgba(203, 75, 22, 0.85); /* Solarized orange */
+}

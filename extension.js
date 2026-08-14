@@ -501,14 +501,6 @@ class WindowPreview {
         this._title.clutter_text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR);
         this._title.clutter_text.set_ellipsize(Pango.EllipsizeMode.NONE);
 
-        this._title.set_style(
-            'font-size: 32px;' +
-            'font-weight: bold;' +
-            'color: white;' +
-            'background-color: rgba(0, 0, 0, 0.55);' +
-            'padding: 8px 16px;'
-        );
-
         this._closeButton = new St.Button({
             style_class: 'window-close-button',
             child: new St.Icon({
