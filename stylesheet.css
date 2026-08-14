@@ -139,3 +139,10 @@
 .dmenu-context-menu .popup-sub-menu {
     background-color: rgba(0, 43, 54, 0.97);
 }
+
+.dmenu-preview-box {
+    background-color: #002b36; /* Solarized base03 */
+    border: 1px solid #586e75; /* Solarized base01 */
+    border-radius: 8px;
+    margin: 4px;
+}

@@ -12,7 +12,7 @@ import { AppMenu } from 'resource:///org/gnome/shell/ui/appMenu.js';
 import { setLogging, setLogFn, journal } from './utils.js';
 
 const SPEC_CACHE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.cache', 'gnome-dbus-spec']);
-const SPEC_CACHE_FILE = 'simple-dmenu.json'; // Fixed filename
+const SPEC_CACHE_FILE = 'simple-dmenu.json';
 
 const BUS_NAME = 'io.github.blueray453.SimpleDmenu';
 const OBJECT_PATH = '/io/github/blueray453/SimpleDmenu';
@@ -86,29 +86,19 @@ class DmenuService {
         this._dbusImpl.emit_signal('Cancelled', null);
     }
 
-    /**
-     * Exports the interface on the session bus and requests ownership of
-     * the well-known name. Both steps are guarded: a failure here, e.g. a
-     * second copy of the extension already owning the name, is logged
-     * instead of throwing out of Extension.enable().
-     */
     export() {
-        // 1. Clean up any previous export, if any.
         this._unexportInterface();
 
-        // 2. Release any previous bus-name ownership.
         if (this._ownerId) {
             Gio.bus_unown_name(this._ownerId);
             this._ownerId = null;
         }
 
-        // 3. Request the bus name and export the interface.
         this._ownerId = Gio.bus_own_name(
             Gio.BusType.SESSION,
             BUS_NAME,
             Gio.BusNameOwnerFlags.NONE,
             (connection) => {
-                // Bus acquired: export the interface on this connection.
                 try {
                     this._dbusImpl.export(connection, OBJECT_PATH);
                     journal(`D-Bus interface exported on ${OBJECT_PATH}`);
@@ -119,11 +109,9 @@ class DmenuService {
                 }
             },
             (connection, name) => {
-                // Name acquired.
                 journal(`${name}: name acquired`);
             },
             (connection, name) => {
-                // Name lost: clean up.
                 journal(`${name}: name lost — another instance may already own it`, true);
                 this._unexportInterface();
                 this._ownerId = null;
@@ -132,19 +120,14 @@ class DmenuService {
     }
 
     unexport() {
-        // Release the bus name. This triggers the name-lost callback,
-        // which calls _unexportInterface().
         if (this._ownerId) {
             Gio.bus_unown_name(this._ownerId);
             this._ownerId = null;
         }
-
-        // Also directly unexport in case the name-lost callback has not fired yet.
         this._unexportInterface();
     }
 
     _unexportInterface() {
-        // Idempotent cleanup: ignore "not exported" errors.
         try {
             if (this._dbusImpl) {
                 this._dbusImpl.unexport();
@@ -158,10 +141,6 @@ class DmenuService {
     }
 }
 
-/**
- * Generate Pango markup with <b> tags around each occurrence of tokens in label.
- * Tokens are matched case-insensitively.
- */
 function highlightLabel(label, tokens) {
     if (!tokens || tokens.length === 0)
         return GLib.markup_escape_text(label, -1);
@@ -220,14 +199,35 @@ const DmenuUI = class {
     constructor(service) {
         this._service = service;
 
+        // Main horizontal container
         this.actor = new St.BoxLayout({
             style_class: 'dmenu-container',
-            vertical: true,
+            vertical: false,
             reactive: true,
             can_focus: true,
         });
 
-        // ---- Pinned apps bar (dash-style), shown above the search entry ----
+        // Left column: menu
+        this._leftBox = new St.BoxLayout({
+            style_class: 'dmenu-left-box',
+            vertical: true,
+            x_expand: false,
+            y_expand: true,
+        });
+
+        // Right column: preview (visible only in window mode without fullscreen)
+        this._previewBox = new St.BoxLayout({
+            style_class: 'dmenu-preview-box',
+            vertical: false,
+            x_expand: true,
+            y_expand: true,
+            visible: false,
+        });
+
+        this.actor.add_child(this._leftBox);
+        this.actor.add_child(this._previewBox);
+
+        // Pinned apps bar
         this.pinned_bar = new St.BoxLayout({
             style_class: 'dmenu-pinned-bar',
             vertical: false,
@@ -259,9 +259,9 @@ const DmenuUI = class {
 
         this.results_container.set_child(this.results_box);
 
-        this.actor.add_child(this.pinned_bar);
-        this.actor.add_child(this.entry);
-        this.actor.add_child(this.results_container);
+        this._leftBox.add_child(this.pinned_bar);
+        this._leftBox.add_child(this.entry);
+        this._leftBox.add_child(this.results_container);
 
         const clutterText = this.entry.get_clutter_text();
         clutterText.connect('text-changed', this._onTextChanged.bind(this));
@@ -286,29 +286,27 @@ const DmenuUI = class {
         this._actionMode = 'stdin';
         this._filterTokens = [];
 
-        // ---- Pin / context-menu state ----
+        // Pin / context-menu state
         this._appFavorites = null;
         this._menuManager = new PopupMenu.PopupMenuManager(this.actor);
         this._openMenu = null;
 
-        // Keep pinned bar + list ordering in sync with favorite changes made
-        // from anywhere: our own menu, Ctrl+P, or outside this popup entirely
-        // (e.g. Nautilus, the app grid).
+        // Preview state
+        this._previewClone = null;
+        this._previewWindow = null;
+        this._previewWindowId = 0;
+        this._previewUnmanagedId = 0;
+        this._showPreview = false;
+        this._previewBoxWidth = 0;
+        this._previewBoxHeight = 0;
+
+        // Favorites changed listener
         AppFavorites.getAppFavorites().connectObject('changed', () => {
             if (this._isOpen && this._actionMode === 'drun') {
                 this._refreshAppOrdering();
                 this._renderPinnedBar();
             }
         }, this.actor);
-
-        // // Super tap is often intercepted at the compositor level before it
-        // // reaches a focused actor's key-press-event, so handle it separately.
-        // global.display.connectObject('overlay-key', () => {
-        //     if (this._isOpen) {
-        //         this._service.emitCancelled();
-        //         this.hide();
-        //     }
-        // }, this.actor);
     }
 
     // ---------- Public API ----------
@@ -360,9 +358,6 @@ const DmenuUI = class {
         const appFavorites = AppFavorites.getAppFavorites();
         const favoriteIdSet = new Set(appFavorites.getFavorites().map(a => a.get_id()));
 
-        // Pinned apps are shown in the bar above the entry (dash-style), not
-        // reordered within this list — they still appear here so search can
-        // find them, tagged with `pinned` for the marker in the row.
         const items = apps.map(a => {
             let shellApp = null;
 
@@ -472,6 +467,13 @@ const DmenuUI = class {
         this._multiSelectEnabled = multi;
         this._fullscreen = fullscreen;
 
+        // Determine if we show preview (window mode + not fullscreen)
+        this._showPreview = (this._actionMode === 'window' && !fullscreen);
+
+        // Show/hide preview box
+        this._previewBox.visible = this._showPreview;
+
+        // Set hints
         if (hint) {
             this.entry.set_hint_text(hint);
         } else if (this._actionMode === 'drun') {
@@ -492,17 +494,54 @@ const DmenuUI = class {
 
         const monitor = Main.layoutManager.primaryMonitor;
 
+        // --- Layout sizing ---
+        let leftWidth, previewWidth, totalWidth, totalHeight;
+
+        if (this._showPreview) {
+            // Large layout: 25% menu / 75% preview, but NOT fullscreen – use 90% width and 80% height, centered
+            const WIDTH_FRAC = 0.9;
+            const HEIGHT_FRAC = 0.8;
+            totalWidth = Math.min(Math.floor(monitor.width * WIDTH_FRAC), monitor.width - 40);
+            totalHeight = Math.min(Math.floor(monitor.height * HEIGHT_FRAC), monitor.height - 40);
+
+            leftWidth = Math.max(300, Math.floor(totalWidth * 0.25));
+            previewWidth = totalWidth - leftWidth - 10; // 10px spacing
+            if (previewWidth < 400) {
+                leftWidth = Math.max(200, totalWidth - 400 - 10);
+                previewWidth = totalWidth - leftWidth - 10;
+            }
+            this._leftBox.set_width(leftWidth);
+            this._previewBoxWidth = previewWidth;
+            this._previewBoxHeight = totalHeight;
+            this.actor.set_width(totalWidth);
+            this.actor.set_height(totalHeight);
+            this.actor.set_position(
+                monitor.x + Math.floor((monitor.width - totalWidth) / 2),
+                monitor.y + Math.floor((monitor.height - totalHeight) / 2)
+            );
+        } else {
+            // Original centered layout (as in the initial code) for other modes
+            const MAX_WIDTH = Math.min(1000, monitor.width - 100);
+            const MAX_HEIGHT = Math.min(600, monitor.height - 150);
+            totalWidth = MAX_WIDTH;
+            totalHeight = MAX_HEIGHT;
+            leftWidth = totalWidth; // preview not shown, left box takes all width
+            this._leftBox.set_width(leftWidth);
+            this.actor.set_width(totalWidth);
+            this.actor.set_height(totalHeight);
+            this.actor.set_position(
+                monitor.x + Math.floor((monitor.width - totalWidth) / 2),
+                monitor.y + Math.floor(monitor.height / 6)
+            );
+        }
+
+        // Fullscreen overrides everything
         if (fullscreen) {
             this.actor.set_width(monitor.width);
             this.actor.set_height(monitor.height);
             this.actor.set_position(monitor.x, monitor.y);
-        } else {
-            this.actor.set_width(Math.min(1000, monitor.width - 100));
-            this.actor.set_height(Math.min(600, monitor.height - 150));
-            this.actor.set_position(
-                monitor.x + Math.floor((monitor.width - this.actor.width) / 2),
-                monitor.y + Math.floor(monitor.height / 6)
-            );
+            this._previewBox.visible = false; // no preview in fullscreen
+            this._leftBox.set_width(monitor.width);
         }
 
         Main.layoutManager.addChrome(this.actor, { affectsInputRegion: true });
@@ -510,7 +549,6 @@ const DmenuUI = class {
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
             if (this._isOpen)
                 this.entry.grab_key_focus();
-
             return GLib.SOURCE_REMOVE;
         });
 
@@ -529,6 +567,7 @@ const DmenuUI = class {
         }
 
         this._closeOpenMenu();
+        this._clearPreview();
 
         if (!this._isOpen)
             return;
@@ -542,11 +581,6 @@ const DmenuUI = class {
         this._rowActors = [];
     }
 
-    /**
-     * Scrolls the native ScrollView so the currently selected row is fully
-     * visible. This waits one idle cycle so Clutter can allocate the newly
-     * created row actors before reading their allocation boxes.
-     */
     _scrollSelectedIntoView() {
         if (this._rowActors.length === 0)
             return;
@@ -557,10 +591,6 @@ const DmenuUI = class {
 
         const SCROLL_TIME = 0.15;
 
-        /*
-         * Wait one idle cycle so Clutter can allocate the newly created rows.
-         * Without this, get_allocation_box() may still return zero-sized boxes.
-         */
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
             if (!this._isOpen || !this._rowActors.includes(selectedRow))
                 return GLib.SOURCE_REMOVE;
@@ -581,19 +611,11 @@ const DmenuUI = class {
             if (!pageSize)
                 return GLib.SOURCE_REMOVE;
 
-            /*
-             * If the scroll view has a fade effect, avoid scrolling the selected
-             * row underneath the faded top/bottom area.
-             */
             let offset = 0;
             const vfade = scrollView.get_effect('fade');
             if (vfade && vfade.fade_margins)
                 offset = vfade.fade_margins.top || 0;
 
-            /*
-             * Get the selected row's allocation box and translate its coordinates
-             * up through its parents until we reach the scroll view.
-             */
             let box = selectedRow.get_allocation_box();
             let y1 = box.y1;
             let y2 = box.y2;
@@ -613,13 +635,10 @@ const DmenuUI = class {
             let newValue = currentValue;
 
             if (y1 < currentValue + offset) {
-                // Selected row is above the visible area.
                 newValue = y1 - offset;
             } else if (y2 > currentValue + pageSize - offset) {
-                // Selected row is below the visible area.
                 newValue = y2 + offset - pageSize;
             } else {
-                // Already fully visible.
                 return GLib.SOURCE_REMOVE;
             }
 
@@ -651,7 +670,6 @@ const DmenuUI = class {
             this._selectedIndex = 0;
             this._updateResults();
             this._filterTimeoutId = null;
-
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -693,10 +711,8 @@ const DmenuUI = class {
         if (this._multiSelectEnabled) {
             if (sym === Clutter.KEY_Tab) {
                 this._toggleCurrent();
-
                 if (this._visibleItems.length > 0)
                     this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
-
                 this._render();
                 return Clutter.EVENT_STOP;
             }
@@ -710,10 +726,8 @@ const DmenuUI = class {
             if ((sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) &&
                 (mods & Clutter.ModifierType.SHIFT_MASK)) {
                 this._toggleCurrent();
-
                 if (this._visibleItems.length > 0)
                     this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
-
                 this._render();
                 return Clutter.EVENT_STOP;
             }
@@ -738,8 +752,6 @@ const DmenuUI = class {
             this._selectedItems.add(id);
     }
 
-    // ---------- Pin / favorites ----------
-
     _togglePinCurrent() {
         if (this._actionMode !== 'drun')
             return;
@@ -754,16 +766,8 @@ const DmenuUI = class {
             favorites.removeFavorite(item.id);
         else
             favorites.addFavorite(item.id);
-
-        // The favorites 'changed' listener wired up in the constructor
-        // takes care of re-rendering the bar and refreshing pinned flags.
     }
 
-    /**
-     * Refreshes each item's `pinned` flag against the current favorites list.
-     * Does not reorder `_allItems` — pinned apps live in the bar, not in the
-     * scrollable list — but keeps rows' pin markers correct.
-     */
     _refreshAppOrdering() {
         if (this._actionMode !== 'drun' || !this._appFavorites)
             return;
@@ -840,8 +844,6 @@ const DmenuUI = class {
         this.hide();
     }
 
-    // ---------- Context menu (New Window / Pin / Details / Open Windows) ----------
-
     _closeOpenMenu() {
         if (this._openMenu) {
             this._openMenu.close();
@@ -874,6 +876,99 @@ const DmenuUI = class {
         return menu;
     }
 
+    // ---------- Preview handling ----------
+
+    _clearPreview() {
+        if (this._previewWindow && this._previewUnmanagedId) {
+            this._previewWindow.disconnect(this._previewUnmanagedId);
+            this._previewUnmanagedId = 0;
+        }
+        if (this._previewClone) {
+            this._previewClone.destroy();
+            this._previewClone = null;
+        }
+        this._previewWindow = null;
+        this._previewWindowId = 0;
+        this._previewBox.remove_all_children();
+    }
+
+    _updatePreview() {
+        if (!this._showPreview || !this._isOpen || this._visibleItems.length === 0) {
+            this._clearPreview();
+            return;
+        }
+
+        const item = this._visibleItems[this._selectedIndex];
+        if (!item || !item.data) {
+            this._clearPreview();
+            return;
+        }
+
+        const window = item.data;
+        if (!(window instanceof Meta.Window)) {
+            this._clearPreview();
+            return;
+        }
+
+        // If the window changed, clear old preview
+        if (this._previewWindow !== window) {
+            this._clearPreview();
+            this._previewWindow = window;
+            this._previewWindowId = window.get_id();
+
+            this._previewUnmanagedId = window.connect('unmanaged', () => {
+                this._clearPreview();
+                this._previewBox.remove_all_children();
+            });
+        }
+
+        let actor = window.get_compositor_private();
+        if (!actor) {
+            this._clearPreview();
+            return;
+        }
+
+        if (!this._previewClone) {
+            this._previewClone = new Clutter.Clone({
+                source: actor,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            this._previewBox.add_child(this._previewClone);
+        } else {
+            this._previewClone.source = actor;
+        }
+
+        const previewWidth = this._previewBoxWidth;
+        const previewHeight = this._previewBoxHeight;
+        if (previewWidth <= 0 || previewHeight <= 0)
+            return;
+
+        let srcWidth = actor.width || 0;
+        let srcHeight = actor.height || 0;
+        if (srcWidth === 0 || srcHeight === 0) {
+            const rect = window.get_frame_rect();
+            srcWidth = rect.width;
+            srcHeight = rect.height;
+        }
+        if (srcWidth === 0 || srcHeight === 0) {
+            srcWidth = 100;
+            srcHeight = 100;
+        }
+
+        const scaleX = previewWidth / srcWidth;
+        const scaleY = previewHeight / srcHeight;
+        const scale = Math.min(scaleX, scaleY, 1.0);
+        const targetWidth = srcWidth * scale;
+        const targetHeight = srcHeight * scale;
+
+        this._previewClone.set_size(targetWidth, targetHeight);
+        this._previewClone.set_position(
+            (previewWidth - targetWidth) / 2,
+            (previewHeight - targetHeight) / 2
+        );
+    }
+
     // ---------- Activation ----------
 
     _activate() {
@@ -894,7 +989,6 @@ const DmenuUI = class {
             if (this._actionMode === 'drun') {
                 for (const item of selectedItems) {
                     const app = item.data;
-
                     if (app && typeof app.launch === 'function') {
                         try {
                             app.launch([], null);
@@ -903,14 +997,11 @@ const DmenuUI = class {
                         }
                     }
                 }
-
                 resultLabels = selectedItems.map(item => item.label);
             } else if (this._actionMode === 'window') {
                 const timestamp = global.get_current_time();
-
                 for (const item of selectedItems) {
                     const win = item.data;
-
                     if (win) {
                         try {
                             const workspace = win.get_workspace();
@@ -923,7 +1014,6 @@ const DmenuUI = class {
                         }
                     }
                 }
-
                 resultLabels = selectedItems.map(item => item.label);
             } else if (this._actionMode === 'paths') {
                 resultLabels = selectedItems.map(item => item.data);
@@ -1073,22 +1163,23 @@ const DmenuUI = class {
         }
 
         this._scrollSelectedIntoView();
+
+        // Update preview after rendering
+        if (this._showPreview) {
+            this._updatePreview();
+        }
     }
 };
 
 export default class SimpleDmenuExtension extends Extension {
-    // No arguments needed! Uses module constants directly.
     _writeSpecCache() {
         try {
             GLib.mkdir_with_parents(SPEC_CACHE_DIR, 0o755);
-
-            // Flat structure: only what the client needs to build the proxy
             const spec = {
                 bus_name: BUS_NAME,
                 object_path: OBJECT_PATH,
                 xml: DBUS_INTERFACE,
             };
-
             const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, SPEC_CACHE_FILE]);
             GLib.file_set_contents(filePath, JSON.stringify(spec, null, 2));
             journal(`Wrote spec cache to ${filePath}`);
@@ -1097,7 +1188,6 @@ export default class SimpleDmenuExtension extends Extension {
         }
     }
 
-    // No arguments needed!
     _removeSpecCache() {
         try {
             const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, SPEC_CACHE_FILE]);
@@ -1112,30 +1202,24 @@ export default class SimpleDmenuExtension extends Extension {
     }
 
     _installCli() {
-        // this.path is the absolute path to your extension directory (GNOME 45+)
         const cliScript = GLib.build_filenamev([this.path, 'cli', 'gdmenu']);
         const binDir = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin']);
         const symlinkPath = GLib.build_filenamev([binDir, 'gdmenu']);
 
         try {
-            // 1. Make the TARGET script executable (0o755 = rwxr-xr-x)
             GLib.chmod(cliScript, 0o755);
-
-            // 2. Ensure ~/.local/bin exists
             GLib.mkdir_with_parents(binDir, 0o755);
 
-            // 3. Create or update the symlink
             const linkFile = Gio.File.new_for_path(symlinkPath);
 
             if (linkFile.query_exists(null)) {
-                // Check if it already points to our script
                 const info = linkFile.query_info(
                     Gio.FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
                     Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
                     null
                 );
                 if (info.get_symlink_target() !== cliScript) {
-                    linkFile.delete(null); // Delete old symlink pointing elsewhere
+                    linkFile.delete(null);
                     linkFile.make_symbolic_link(cliScript, null);
                     journal(`Updated CLI symlink: ${symlinkPath}`);
                 }
@@ -1160,7 +1244,6 @@ export default class SimpleDmenuExtension extends Extension {
                     Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
                     null
                 );
-                // SAFETY: Only delete if it points to OUR script
                 if (info.get_symlink_target() === cliScript) {
                     linkFile.delete(null);
                     journal(`Removed CLI symlink`);
