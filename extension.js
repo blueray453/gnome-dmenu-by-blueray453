@@ -2,9 +2,9 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
-import Pango from 'gi://Pango';
 import Shell from 'gi://Shell';
 import Meta from 'gi://Meta';
+import Pango from 'gi://Pango';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as AppFavorites from 'resource:///org/gnome/shell/ui/appFavorites.js';
@@ -12,11 +12,22 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import { AppMenu } from 'resource:///org/gnome/shell/ui/appMenu.js';
 import { setLogging, setLogFn, journal } from './utils.js';
 
-const SPEC_CACHE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.cache', 'gnome-dbus-spec']);
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const SPEC_CACHE_DIR = GLib.build_filenamev([
+    GLib.get_home_dir(),
+    '.cache',
+    'gnome-dbus-spec',
+]);
 const SPEC_CACHE_FILE = 'simple-dmenu.json';
 
 const BUS_NAME = 'io.github.blueray453.SimpleDmenu';
 const OBJECT_PATH = '/io/github/blueray453/SimpleDmenu';
+
+const FILTER_DEBOUNCE_MS = 150;
+const SCROLL_TIME = 0.15;
 
 const DBUS_INTERFACE = `<node>
   <interface name="io.github.blueray453.SimpleDmenu">
@@ -54,93 +65,9 @@ const DBUS_INTERFACE = `<node>
   </interface>
 </node>`;
 
-const FILTER_DEBOUNCE_MS = 150;
-
-class DmenuService {
-    constructor(extension) {
-        this._extension = extension;
-        this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_INTERFACE, this);
-        this._ownerId = null;
-    }
-
-    Show(items, multi, hint, fullscreen) {
-        this._extension.show(items, multi, hint, fullscreen);
-    }
-
-    ShowApps(multi, hint, fullscreen) {
-        this._extension.showApps(multi, hint, fullscreen);
-    }
-
-    ShowWindows(multi, hint, fullscreen) {
-        this._extension.showWindows(multi, hint, fullscreen);
-    }
-
-    ShowPaths(paths, multi, hint, fullscreen) {
-        this._extension.showPaths(paths, multi, hint, fullscreen);
-    }
-
-    emitSelected(items) {
-        this._dbusImpl.emit_signal('Selected', GLib.Variant.new('(as)', [items]));
-    }
-
-    emitCancelled() {
-        this._dbusImpl.emit_signal('Cancelled', null);
-    }
-
-    export() {
-        this._unexportInterface();
-
-        if (this._ownerId) {
-            Gio.bus_unown_name(this._ownerId);
-            this._ownerId = null;
-        }
-
-        this._ownerId = Gio.bus_own_name(
-            Gio.BusType.SESSION,
-            BUS_NAME,
-            Gio.BusNameOwnerFlags.NONE,
-            (connection) => {
-                try {
-                    this._dbusImpl.export(connection, OBJECT_PATH);
-                    journal(`D-Bus interface exported on ${OBJECT_PATH}`);
-                    this._exported = true;
-                } catch (e) {
-                    journal(`Failed to export D-Bus interface: ${e.message}`, true);
-                    this._exported = false;
-                }
-            },
-            (connection, name) => {
-                journal(`${name}: name acquired`);
-            },
-            (connection, name) => {
-                journal(`${name}: name lost — another instance may already own it`, true);
-                this._unexportInterface();
-                this._ownerId = null;
-            }
-        );
-    }
-
-    unexport() {
-        if (this._ownerId) {
-            Gio.bus_unown_name(this._ownerId);
-            this._ownerId = null;
-        }
-        this._unexportInterface();
-    }
-
-    _unexportInterface() {
-        try {
-            if (this._dbusImpl) {
-                this._dbusImpl.unexport();
-                this._exported = false;
-            }
-        } catch (e) {
-            if (!e.message.includes('not exported')) {
-                journal(`Failed to unexport D-Bus interface: ${e.message}`, true);
-            }
-        }
-    }
-}
+// ============================================================
+// HELPERS
+// ============================================================
 
 function highlightLabel(label, tokens) {
     if (!tokens || tokens.length === 0)
@@ -196,202 +123,481 @@ function highlightLabel(label, tokens) {
     return markup;
 }
 
-const DmenuUI = class {
-    constructor(service) {
-        this._service = service;
+// ============================================================
+// DATA MODEL
+// ============================================================
 
-        // Main horizontal container
-        this.actor = new St.BoxLayout({
-            style_class: 'dmenu-container',
-            vertical: false,
+class MenuItem {
+    constructor({
+        id,
+        label,
+        icon = null,
+        data = null,
+        shellApp = null,
+        pinned = false,
+    }) {
+        this.id = id;
+        this.label = label;
+        this.icon = icon;
+        this.data = data;
+        this.shellApp = shellApp;
+        this.pinned = pinned;
+    }
+}
+
+// ============================================================
+// SEARCH MODEL
+// ============================================================
+
+class SearchModel {
+    constructor() {
+        this._allItems = [];
+        this._visibleItems = [];
+        this._tokens = [];
+    }
+
+    setItems(items) {
+        this._allItems = [...items];
+        this._visibleItems = [...items];
+    }
+
+    get allItems() {
+        return this._allItems;
+    }
+
+    get visibleItems() {
+        return this._visibleItems;
+    }
+
+    get tokens() {
+        return this._tokens;
+    }
+
+    setQuery(query) {
+        const filter = (query || '').trim().toLowerCase();
+        this._tokens = filter.split(/\s+/).filter(Boolean);
+
+        if (this._tokens.length === 0) {
+            this._visibleItems = [...this._allItems];
+            return this._visibleItems;
+        }
+
+        this._visibleItems = this._allItems.filter(item => {
+            const lower = item.label.toLowerCase();
+            return this._tokens.every(token => lower.includes(token));
+        });
+
+        return this._visibleItems;
+    }
+
+    removeItemByData(data) {
+        const before = this._allItems.length;
+        this._allItems = this._allItems.filter(item => item.data !== data);
+        return before !== this._allItems.length;
+    }
+
+    removeItemById(id) {
+        const normalized = String(id);
+        const before = this._allItems.length;
+
+        this._allItems = this._allItems.filter(
+            item => String(item.id) !== normalized
+        );
+
+        return before !== this._allItems.length;
+    }
+
+    updateItem(id, updater) {
+        const item = this._allItems.find(item => String(item.id) === String(id));
+        if (!item)
+            return false;
+
+        updater(item);
+        return true;
+    }
+}
+
+// ============================================================
+// SELECTION MODEL
+// ============================================================
+
+class SelectionModel {
+    constructor() {
+        this.index = 0;
+        this.selectedIds = new Set();
+    }
+
+    reset() {
+        this.index = 0;
+        this.selectedIds.clear();
+    }
+
+    clamp(count) {
+        if (count <= 0) {
+            this.index = 0;
+            return;
+        }
+
+        this.index = Math.max(0, Math.min(this.index, count - 1));
+    }
+
+    moveUp(count) {
+        if (count <= 0)
+            return;
+
+        this.index = Math.max(0, this.index - 1);
+    }
+
+    moveDown(count) {
+        if (count <= 0)
+            return;
+
+        this.index = Math.min(count - 1, this.index + 1);
+    }
+
+    next(count) {
+        if (count <= 0)
+            return;
+
+        this.index = Math.min(count - 1, this.index + 1);
+    }
+
+    toggle(item) {
+        if (!item)
+            return;
+
+        if (this.selectedIds.has(item.id))
+            this.selectedIds.delete(item.id);
+        else
+            this.selectedIds.add(item.id);
+    }
+
+    clear() {
+        this.selectedIds.clear();
+    }
+
+    getSelectedItems(items) {
+        if (this.selectedIds.size === 0)
+            return [];
+
+        return items.filter(item => this.selectedIds.has(item.id));
+    }
+}
+
+// ============================================================
+// APP MENU CONTROLLER
+// ============================================================
+
+class AppMenuController {
+    constructor(sourceActor) {
+        this._sourceActor = sourceActor;
+        this._menuManager = new PopupMenu.PopupMenuManager(sourceActor);
+        this._openMenu = null;
+    }
+
+    openForApp(sourceActor, app) {
+        this.close();
+
+        const menu = new AppMenu(sourceActor, St.Side.BOTTOM, {
+            favoritesSection: true,
+            showSingleWindows: true,
+        });
+
+        menu.actor.add_style_class_name('dmenu-context-menu');
+
+        Main.layoutManager.addChrome(menu.actor);
+        menu.actor.hide();
+        this._menuManager.addMenu(menu);
+
+        menu.setApp(app);
+
+        this._openMenu = menu;
+
+        menu.connect('open-state-changed', (o, isOpen) => {
+            if (!isOpen) {
+                if (menu === this._openMenu)
+                    this._openMenu = null;
+
+                menu.destroy();
+            }
+        });
+
+        menu.open(true);
+        return menu;
+    }
+
+    close() {
+        if (!this._openMenu)
+            return;
+
+        const menu = this._openMenu;
+        this._openMenu = null;
+
+        try {
+            menu.close();
+        } catch (e) {
+            journal(`Failed to close app menu: ${e.message}`, true);
+        }
+    }
+}
+
+// ============================================================
+// WINDOW PREVIEW / CLONE
+// ============================================================
+
+class WindowPreview {
+    constructor(container, onWindowClosed = null) {
+        this._container = container;
+        this._onWindowClosed = onWindowClosed;
+
+        this._window = null;
+        this._unmanagedId = 0;
+
+        this._overlay = null;
+        this._clone = null;
+        this._title = null;
+        this._closeButton = null;
+    }
+
+    show(window, width, height) {
+        if (!(window instanceof Meta.Window)) {
+            this.hide();
+            return;
+        }
+
+        if (width <= 0 || height <= 0) {
+            this.hide();
+            return;
+        }
+
+        if (this._window !== window) {
+            this.hide();
+            this._window = window;
+            this._connectWindowLifecycle(window);
+        }
+
+        const actor = window.get_compositor_private();
+        if (!actor) {
+            this.hide();
+            return;
+        }
+
+        this._ensureActors(actor);
+
+        this._overlay.set_size(width, height);
+        this._clone.source = actor;
+
+        const [targetWidth, targetHeight] = this._calculateTargetSize(
+            window,
+            actor,
+            width,
+            height
+        );
+
+        const cloneX = (width - targetWidth) / 2;
+        const cloneY = (height - targetHeight) / 2;
+
+        this._clone.set_size(targetWidth, targetHeight);
+        this._clone.set_position(cloneX, cloneY);
+
+        this._updateTitle(window, targetWidth, targetHeight, cloneX, cloneY);
+        this._updateCloseButton(targetWidth, cloneX, cloneY);
+    }
+
+    hide() {
+        this._disconnectWindowLifecycle();
+        this._window = null;
+
+        if (this._overlay)
+            this._overlay.destroy();
+
+        this._overlay = null;
+        this._clone = null;
+        this._title = null;
+        this._closeButton = null;
+
+        this._container.remove_all_children();
+    }
+
+    destroy() {
+        this.hide();
+    }
+
+    _connectWindowLifecycle(window) {
+        this._unmanagedId = window.connect('unmanaged', () => {
+            this._unmanagedId = 0;
+
+            const closedWindow = this._window;
+            this._window = null;
+
+            if (this._overlay)
+                this._overlay.destroy();
+
+            this._overlay = null;
+            this._clone = null;
+            this._title = null;
+            this._closeButton = null;
+            this._container.remove_all_children();
+
+            if (this._onWindowClosed)
+                this._onWindowClosed(closedWindow);
+        });
+    }
+
+    _disconnectWindowLifecycle() {
+        if (!this._window || !this._unmanagedId)
+            return;
+
+        try {
+            this._window.disconnect(this._unmanagedId);
+        } catch (e) {
+            journal(`Failed to disconnect window preview signal: ${e.message}`, true);
+        }
+
+        this._unmanagedId = 0;
+    }
+
+    _ensureActors(actor) {
+        if (this._overlay)
+            return;
+
+        this._overlay = new Clutter.Actor({
+            reactive: true,
+        });
+
+        this._clone = new Clutter.Clone({
+            source: actor,
+        });
+
+        this._title = new St.Label({
+            style_class: 'window-preview-title',
+            x_align: Clutter.ActorAlign.FILL,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+
+        this._title.clutter_text.set_x_align(Clutter.ActorAlign.CENTER);
+        this._title.clutter_text.set_y_align(Clutter.ActorAlign.CENTER);
+        this._title.clutter_text.set_line_wrap(true);
+        this._title.clutter_text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR);
+        this._title.clutter_text.set_ellipsize(Pango.EllipsizeMode.NONE);
+
+        this._title.set_style(
+            'font-size: 32px;' +
+            'font-weight: bold;' +
+            'color: white;' +
+            'background-color: rgba(0, 0, 0, 0.55);' +
+            'padding: 8px 16px;'
+        );
+
+        this._closeButton = new St.Button({
+            style_class: 'window-close-button',
+            child: new St.Icon({
+                icon_name: 'window-close-symbolic',
+                icon_size: 32,
+            }),
             reactive: true,
             can_focus: true,
+            track_hover: true,
         });
 
-        // Left column: menu
-        this._leftBox = new St.BoxLayout({
-            style_class: 'dmenu-left-box',
-            vertical: true,
-            x_expand: false,
-            y_expand: true,
-        });
-
-        // Right column: preview (visible only in window mode without fullscreen)
-        this._previewBox = new St.BoxLayout({
-            style_class: 'dmenu-preview-box',
-            vertical: false,
-            x_expand: true,
-            y_expand: true,
-            visible: false,
-        });
-
-        this.actor.add_child(this._leftBox);
-        this.actor.add_child(this._previewBox);
-
-        // Pinned apps bar
-        this.pinned_bar = new St.BoxLayout({
-            style_class: 'dmenu-pinned-bar',
-            vertical: false,
-            x_expand: true,
-        });
-        this.pinned_bar.hide();
-
-        this.entry = new St.Entry({
-            style_class: 'dmenu-entry',
-            hint_text: 'Type to filter · Enter: select · Tab: multi-select · Esc: cancel',
-            can_focus: true,
-            x_expand: true,
-        });
-
-        this.results_container = new St.ScrollView({
-            style_class: 'dmenu-results-container',
-            hscrollbar_policy: St.PolicyType.NEVER,
-            vscrollbar_policy: St.PolicyType.AUTOMATIC,
-            x_expand: true,
-            y_expand: true,
-            reactive: true,
-        });
-
-        this.results_box = new St.BoxLayout({
-            style_class: 'dmenu-results-box',
-            vertical: true,
-            reactive: true,
-        });
-
-        this.results_container.set_child(this.results_box);
-
-        this._leftBox.add_child(this.pinned_bar);
-        this._leftBox.add_child(this.entry);
-        this._leftBox.add_child(this.results_container);
-
-        const clutterText = this.entry.get_clutter_text();
-        clutterText.connect('text-changed', this._onTextChanged.bind(this));
-        clutterText.connect('activate', this._activate.bind(this));
-
-        this.actor.connect('key-press-event', this._onKeyPress.bind(this));
-        this.actor.connect('button-press-event', () => {
-            this.entry.grab_key_focus();
+        this._closeButton.connect('clicked', () => {
+            this._requestClose();
             return Clutter.EVENT_STOP;
         });
 
-        this._allItems = [];
-        this._visibleItems = [];
-        this._rowActors = [];
-        this._selectedIndex = 0;
-        this._selectedItems = new Set();
-        this._filterTimeoutId = null;
-        this._scrollIdleId = null;
-        this._isOpen = false;
-        this._multiSelectEnabled = false;
-        this._fullscreen = false;
-        this._actionMode = 'stdin';
-        this._filterTokens = [];
-
-        // Pin / context-menu state
-        this._appFavorites = null;
-        this._menuManager = new PopupMenu.PopupMenuManager(this.actor);
-        this._openMenu = null;
-
-        // Preview state
-
-        this._previewClone = null;
-        this._previewOverlay = null;
-        this._previewTitle = null;
-        this._previewCloseButton = null;
-
-        this._previewWindow = null;
-        this._previewWindowId = 0;
-        this._previewUnmanagedId = 0;
-
-        this._showPreview = false;
-        this._previewBoxWidth = 0;
-        this._previewBoxHeight = 0;
-
-        // Favorites changed listener
-        AppFavorites.getAppFavorites().connectObject('changed', () => {
-            if (this._isOpen && this._actionMode === 'drun') {
-                this._refreshAppOrdering();
-                this._renderPinnedBar();
-            }
-        }, this.actor);
+        this._overlay.add_child(this._clone);
+        this._overlay.add_child(this._title);
+        this._overlay.add_child(this._closeButton);
+        this._container.add_child(this._overlay);
     }
 
-    // ---------- Public API ----------
+    _requestClose() {
+        const window = this._window;
+        if (!window)
+            return;
 
-    show(items, multi = false, hint = null, fullscreen = false) {
-        const idMap = new Map();
-
-        const itemObjects = items.map((item, index) => {
-            let label;
-            let id;
-
-            if (typeof item === 'string') {
-                label = item;
-                id = item;
-            } else {
-                label = item.label;
-                id = item.id || item.label;
-            }
-
-            if (idMap.has(id))
-                id = `${id}_${index}`;
-
-            idMap.set(id, true);
-
-            return {
-                label,
-                icon: item.icon || null,
-                data: item.data || null,
-                id,
-            };
-        });
-
-        this._actionMode = 'stdin';
-        this._appFavorites = null;
-        this._showItems(itemObjects, multi, hint, fullscreen);
+        try {
+            window.delete(global.get_current_time());
+        } catch (e) {
+            journal(`Failed to close preview window: ${e.message}`, true);
+        }
     }
 
-    showApps(multi = false, hint = null, fullscreen = false) {
-        const appSystem = Shell.AppSystem.get_default();
-        let apps = [];
+    _calculateTargetSize(window, actor, previewWidth, previewHeight) {
+        let srcWidth = actor.width || 0;
+        let srcHeight = actor.height || 0;
 
-        if (appSystem && typeof appSystem.get_all === 'function')
-            apps = appSystem.get_all().filter(a => a.should_show());
-        else
-            apps = Gio.AppInfo.get_all().filter(a => a.should_show());
+        if (srcWidth === 0 || srcHeight === 0) {
+            const rect = window.get_frame_rect();
+            srcWidth = rect.width;
+            srcHeight = rect.height;
+        }
 
-        apps.sort((a, b) => a.get_name().localeCompare(b.get_name()));
+        if (srcWidth === 0 || srcHeight === 0) {
+            srcWidth = 100;
+            srcHeight = 100;
+        }
 
-        const appFavorites = AppFavorites.getAppFavorites();
-        const favoriteIdSet = new Set(appFavorites.getFavorites().map(a => a.get_id()));
+        const scaleX = previewWidth / srcWidth;
+        const scaleY = previewHeight / srcHeight;
+        const scale = Math.min(scaleX, scaleY, 1.0);
 
-        const items = apps.map(a => {
-            let shellApp = null;
-
-            try {
-                if (appSystem && typeof appSystem.lookup_app === 'function')
-                    shellApp = appSystem.lookup_app(a.get_id());
-            } catch (e) {
-                journal(`Could not get Shell.App for ${a.get_id()}: ${e.message}`, true);
-            }
-
-            return {
-                label: a.get_name(),
-                icon: a.get_icon(),
-                data: a,
-                shellApp: shellApp,
-                id: a.get_id(),
-                pinned: favoriteIdSet.has(a.get_id()),
-            };
-        });
-
-        this._actionMode = 'drun';
-        this._appFavorites = appFavorites;
-        this._showItems(items, multi, hint, fullscreen);
+        return [
+            srcWidth * scale,
+            srcHeight * scale,
+        ];
     }
 
-    showWindows(multi = false, hint = null, fullscreen = false) {
-        const windows = global.display.get_tab_list(Meta.TabList.NORMAL, null);
+    _updateTitle(window, targetWidth, targetHeight, cloneX, cloneY) {
+        if (!this._title)
+            return;
+
+        const titleText = window.get_title();
+        this._title.text = titleText && titleText.trim()
+            ? titleText
+            : 'Untitled';
+
+        const titleHeight = Math.min(
+            140,
+            Math.max(60, targetHeight * 0.25)
+        );
+
+        this._title.set_size(targetWidth, titleHeight);
+        this._title.set_position(
+            cloneX,
+            cloneY + (targetHeight - titleHeight) / 2
+        );
+    }
+
+    _updateCloseButton(targetWidth, cloneX, cloneY) {
+        if (!this._closeButton)
+            return;
+
+        const size = 48;
+        const margin = 10;
+
+        this._closeButton.set_size(size, size);
+        this._closeButton.set_position(
+            cloneX + targetWidth - size - margin,
+            cloneY + margin
+        );
+    }
+}
+
+// ============================================================
+// WINDOW MODE
+// ============================================================
+
+class WindowMode {
+    constructor(controller) {
+        this._controller = controller;
+    }
+
+    getItems() {
+        const windows = global.display.get_tab_list(
+            Meta.TabList.NORMAL,
+            null
+        );
 
         let tracker = null;
         if (typeof Shell.WindowTracker.get_default === 'function')
@@ -399,30 +605,162 @@ const DmenuUI = class {
         else
             tracker = Main.windowTracker;
 
-        const items = windows.map(w => {
-            let title = w.get_title();
+        return windows.map(window => {
+            let title = window.get_title();
             if (!title || title.trim() === '')
                 title = 'Untitled';
 
-            const app = tracker ? tracker.get_window_app(w) : null;
-            const icon = app ? app.get_icon() : Gio.ThemedIcon.new('application-x-executable');
+            const app = tracker ? tracker.get_window_app(window) : null;
+            const icon = app
+                ? app.get_icon()
+                : Gio.ThemedIcon.new('application-x-executable');
 
-            return {
+            return new MenuItem({
                 label: title,
                 icon,
-                data: w,
-                id: String(w.get_id()),
-            };
+                data: window,
+                id: String(window.get_id()),
+            });
         });
-
-        this._actionMode = 'window';
-        this._appFavorites = null;
-        this._showItems(items, multi, hint, fullscreen);
     }
 
-    showPaths(paths, multi = false, hint = null, fullscreen = false) {
-        const items = paths.map(path => {
-            const label = path;
+    activate(item) {
+        const window = item?.data;
+        if (!window)
+            return;
+
+        const timestamp = global.get_current_time();
+
+        try {
+            const workspace = window.get_workspace();
+            if (workspace)
+                workspace.activate_with_focus(window, timestamp);
+            else
+                window.activate(timestamp);
+        } catch (e) {
+            journal(`Failed to activate window ${item.label}: ${e.message}`, true);
+        }
+    }
+
+    handleClosedWindow(window) {
+        if (!window)
+            return;
+
+        journal(`[WindowMode] Window closed: ${window.get_title() || 'Untitled'}`);
+        this._controller.removeItemByData(window);
+    }
+}
+
+// ============================================================
+// DRUN MODE
+// ============================================================
+
+class DrunMode {
+    constructor(controller) {
+        this._controller = controller;
+        this._favorites = AppFavorites.getAppFavorites();
+    }
+
+    getItems() {
+        const appSystem = Shell.AppSystem.get_default();
+        let apps = [];
+
+        if (appSystem && typeof appSystem.get_all === 'function')
+            apps = appSystem.get_all().filter(app => app.should_show());
+        else
+            apps = Gio.AppInfo.get_all().filter(app => app.should_show());
+
+        apps.sort((a, b) => a.get_name().localeCompare(b.get_name()));
+
+        const favoriteIds = new Set(
+            this._favorites.getFavorites().map(app => app.get_id())
+        );
+
+        return apps.map(app => {
+            let shellApp = null;
+
+            try {
+                if (appSystem && typeof appSystem.lookup_app === 'function')
+                    shellApp = appSystem.lookup_app(app.get_id());
+            } catch (e) {
+                journal(
+                    `Could not get Shell.App for ${app.get_id()}: ${e.message}`,
+                    true
+                );
+            }
+
+            return new MenuItem({
+                label: app.get_name(),
+                icon: app.get_icon(),
+                data: app,
+                shellApp,
+                id: app.get_id(),
+                pinned: favoriteIds.has(app.get_id()),
+            });
+        });
+    }
+
+    activate(item) {
+        const app = item?.data;
+        if (!app || typeof app.launch !== 'function')
+            return;
+
+        try {
+            app.launch([], null);
+        } catch (e) {
+            journal(`Failed to launch ${item.label}: ${e.message}`, true);
+        }
+    }
+
+    togglePin(item) {
+        if (!item)
+            return;
+
+        if (this._favorites.isFavorite(item.id))
+            this._favorites.removeFavorite(item.id);
+        else
+            this._favorites.addFavorite(item.id);
+    }
+
+    getFavorites() {
+        return this._favorites.getFavorites();
+    }
+
+    isFavoriteChangedListener(callback) {
+        return this._favorites.connect('changed', callback);
+    }
+
+    disconnectFavoriteListener(id) {
+        if (!id)
+            return;
+
+        try {
+            this._favorites.disconnect(id);
+        } catch (e) {
+            journal(`Failed to disconnect favorites signal: ${e.message}`, true);
+        }
+    }
+
+    activatePinned(app) {
+        try {
+            app.launch([], null);
+        } catch (e) {
+            journal(`Failed to launch ${app.get_name()}: ${e.message}`, true);
+        }
+    }
+}
+
+// ============================================================
+// PATH MODE
+// ============================================================
+
+class PathMode {
+    constructor(controller) {
+        this._controller = controller;
+    }
+
+    getItems(paths) {
+        return paths.map(path => {
             let icon = null;
 
             try {
@@ -442,127 +780,170 @@ const DmenuUI = class {
             if (!icon)
                 icon = Gio.ThemedIcon.new('folder');
 
-            return {
-                label,
+            return new MenuItem({
+                label: path,
                 icon,
                 data: path,
                 id: path,
-            };
+            });
+        });
+    }
+
+    activate(item) {
+        return item?.data ?? null;
+    }
+}
+
+// ============================================================
+// GENERIC / STDIN MODE
+// ============================================================
+
+class CustomMode {
+    constructor(controller) {
+        this._controller = controller;
+    }
+
+    getItems(items) {
+        const idMap = new Map();
+
+        return items.map((item, index) => {
+            let label;
+            let id;
+
+            if (typeof item === 'string') {
+                label = item;
+                id = item;
+            } else {
+                label = item.label;
+                id = item.id || item.label;
+            }
+
+            if (idMap.has(id))
+                id = `${id}_${index}`;
+
+            idMap.set(id, true);
+
+            return new MenuItem({
+                label,
+                icon: item.icon || null,
+                data: item.data || null,
+                id,
+            });
+        });
+    }
+
+    activate(item) {
+        return item?.label ?? null;
+    }
+}
+
+// ============================================================
+// MAIN VIEW
+// ============================================================
+
+class DmenuView {
+    constructor(controller) {
+        this._controller = controller;
+
+        this.actor = new St.BoxLayout({
+            style_class: 'dmenu-container',
+            vertical: false,
+            reactive: true,
+            can_focus: true,
         });
 
-        this._actionMode = 'paths';
-        this._appFavorites = null;
-        this._showItems(items, multi, hint, fullscreen);
+        this.leftBox = new St.BoxLayout({
+            style_class: 'dmenu-left-box',
+            vertical: true,
+            x_expand: false,
+            y_expand: true,
+        });
+
+        this.previewBox = new St.BoxLayout({
+            style_class: 'dmenu-preview-box',
+            vertical: false,
+            x_expand: true,
+            y_expand: true,
+            visible: false,
+        });
+
+        this.actor.add_child(this.leftBox);
+        this.actor.add_child(this.previewBox);
+
+        this.pinnedBar = new St.BoxLayout({
+            style_class: 'dmenu-pinned-bar',
+            vertical: false,
+            x_expand: true,
+        });
+        this.pinnedBar.hide();
+
+        this.entry = new St.Entry({
+            style_class: 'dmenu-entry',
+            hint_text: 'Type to filter · Enter: select · Tab: multi-select · Esc: cancel',
+            can_focus: true,
+            x_expand: true,
+        });
+
+        this.resultsContainer = new St.ScrollView({
+            style_class: 'dmenu-results-container',
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            x_expand: true,
+            y_expand: true,
+            reactive: true,
+        });
+
+        this.resultsBox = new St.BoxLayout({
+            style_class: 'dmenu-results-box',
+            vertical: true,
+            reactive: true,
+        });
+
+        this.resultsContainer.set_child(this.resultsBox);
+
+        this.leftBox.add_child(this.pinnedBar);
+        this.leftBox.add_child(this.entry);
+        this.leftBox.add_child(this.resultsContainer);
+
+        this._rowActors = [];
+        this._filterTimeoutId = null;
+        this._scrollIdleId = null;
+
+        this.entry.get_clutter_text().connect(
+            'text-changed',
+            () => this._handleTextChanged()
+        );
+
+        this.entry.get_clutter_text().connect(
+            'activate',
+            () => this._controller.activate()
+        );
+
+        this.actor.connect(
+            'key-press-event',
+            (actor, event) => this._controller.handleKeyPress(actor, event)
+        );
+
+        this.actor.connect('button-press-event', () => {
+            this.entry.grab_key_focus();
+            return Clutter.EVENT_STOP;
+        });
+    }
+
+    destroy() {
+        this.cancelPendingWork();
+        this.actor.destroy();
+    }
+
+    show() {
+        this.actor.show();
     }
 
     hide() {
-        this._closeInternal();
+        this.actor.hide();
     }
 
-    // ---------- Internal UI logic ----------
-
-    _showItems(items, multi, hint, fullscreen) {
-        if (this._isOpen)
-            this._closeInternal();
-
-        if (this._scrollIdleId) {
-            GLib.source_remove(this._scrollIdleId);
-            this._scrollIdleId = null;
-        }
-
-        this._allItems = items;
-        this._multiSelectEnabled = multi;
-        this._fullscreen = fullscreen;
-
-        // Determine if we show preview (window mode + not fullscreen)
-        this._showPreview = (this._actionMode === 'window' && !fullscreen);
-
-        // Show/hide preview box
-        this._previewBox.visible = this._showPreview;
-
-        // Set hints
-        if (hint) {
-            this.entry.set_hint_text(hint);
-        } else if (this._actionMode === 'drun') {
-            this.entry.set_hint_text('Type to filter · Enter: launch · Ctrl+P: pin/unpin · Super/Esc: cancel');
-        } else if (multi) {
-            this.entry.set_hint_text('Type to filter · Enter: select · Tab: multi-select · Esc: cancel');
-        } else {
-            this.entry.set_hint_text('Type to filter · Enter: select · Esc: cancel');
-        }
-
-        this.entry.set_text('');
-        this._selectedIndex = 0;
-        this._selectedItems.clear();
-        this._filterTokens = [];
-        this._isOpen = true;
-
-        this._renderPinnedBar();
-
-        const monitor = Main.layoutManager.primaryMonitor;
-
-        // --- Layout sizing ---
-        let leftWidth, previewWidth, totalWidth, totalHeight;
-
-        if (this._showPreview) {
-            // Large layout: 25% menu / 75% preview, but NOT fullscreen – use 90% width and 80% height, centered
-            const WIDTH_FRAC = 0.9;
-            const HEIGHT_FRAC = 0.8;
-            totalWidth = Math.min(Math.floor(monitor.width * WIDTH_FRAC), monitor.width - 40);
-            totalHeight = Math.min(Math.floor(monitor.height * HEIGHT_FRAC), monitor.height - 40);
-
-            leftWidth = Math.max(300, Math.floor(totalWidth * 0.25));
-            previewWidth = totalWidth - leftWidth - 10; // 10px spacing
-            if (previewWidth < 400) {
-                leftWidth = Math.max(200, totalWidth - 400 - 10);
-                previewWidth = totalWidth - leftWidth - 10;
-            }
-            this._leftBox.set_width(leftWidth);
-            this._previewBoxWidth = previewWidth;
-            this._previewBoxHeight = totalHeight;
-            this.actor.set_width(totalWidth);
-            this.actor.set_height(totalHeight);
-            this.actor.set_position(
-                monitor.x + Math.floor((monitor.width - totalWidth) / 2),
-                monitor.y + Math.floor((monitor.height - totalHeight) / 2)
-            );
-        } else {
-            // Original centered layout (as in the initial code) for other modes
-            const MAX_WIDTH = Math.min(1000, monitor.width - 100);
-            const MAX_HEIGHT = Math.min(600, monitor.height - 150);
-            totalWidth = MAX_WIDTH;
-            totalHeight = MAX_HEIGHT;
-            leftWidth = totalWidth; // preview not shown, left box takes all width
-            this._leftBox.set_width(leftWidth);
-            this.actor.set_width(totalWidth);
-            this.actor.set_height(totalHeight);
-            this.actor.set_position(
-                monitor.x + Math.floor((monitor.width - totalWidth) / 2),
-                monitor.y + Math.floor(monitor.height / 6)
-            );
-        }
-
-        // Fullscreen overrides everything
-        if (fullscreen) {
-            this.actor.set_width(monitor.width);
-            this.actor.set_height(monitor.height);
-            this.actor.set_position(monitor.x, monitor.y);
-            this._previewBox.visible = false; // no preview in fullscreen
-            this._leftBox.set_width(monitor.width);
-        }
-
-        Main.layoutManager.addChrome(this.actor, { affectsInputRegion: true });
-
-        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-            if (this._isOpen)
-                this.entry.grab_key_focus();
-            return GLib.SOURCE_REMOVE;
-        });
-
-        this._updateResults();
-    }
-
-    _closeInternal() {
+    cancelPendingWork() {
         if (this._filterTimeoutId) {
             GLib.source_remove(this._filterTimeoutId);
             this._filterTimeoutId = null;
@@ -572,39 +953,262 @@ const DmenuUI = class {
             GLib.source_remove(this._scrollIdleId);
             this._scrollIdleId = null;
         }
-
-        this._closeOpenMenu();
-        this._clearPreview();
-
-        if (!this._isOpen)
-            return;
-
-        this.pinned_bar.hide();
-        this.pinned_bar.remove_all_children();
-
-        Main.layoutManager.removeChrome(this.actor);
-        this._isOpen = false;
-        this._filterTokens = [];
-        this._rowActors = [];
     }
 
-    _scrollSelectedIntoView() {
+    setHint(text) {
+        this.entry.set_hint_text(text);
+    }
+
+    resetInput() {
+        this.entry.set_text('');
+    }
+
+    getQuery() {
+        return this.entry.get_text();
+    }
+
+    focusInput(isOpen) {
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            if (isOpen)
+                this.entry.grab_key_focus();
+
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    configureLayout(showPreview, fullscreen) {
+        const monitor = Main.layoutManager.primaryMonitor;
+
+        let totalWidth;
+        let totalHeight;
+        let leftWidth;
+        let previewWidth = 0;
+
+        if (showPreview) {
+            const WIDTH_FRAC = 0.9;
+            const HEIGHT_FRAC = 0.8;
+
+            totalWidth = Math.min(
+                Math.floor(monitor.width * WIDTH_FRAC),
+                monitor.width - 40
+            );
+
+            totalHeight = Math.min(
+                Math.floor(monitor.height * HEIGHT_FRAC),
+                monitor.height - 40
+            );
+
+            leftWidth = Math.max(300, Math.floor(totalWidth * 0.25));
+            previewWidth = totalWidth - leftWidth - 10;
+
+            if (previewWidth < 400) {
+                leftWidth = Math.max(200, totalWidth - 400 - 10);
+                previewWidth = totalWidth - leftWidth - 10;
+            }
+
+            this.leftBox.set_width(leftWidth);
+            this.previewBox.visible = true;
+        } else {
+            const MAX_WIDTH = Math.min(1000, monitor.width - 100);
+            const MAX_HEIGHT = Math.min(600, monitor.height - 150);
+
+            totalWidth = MAX_WIDTH;
+            totalHeight = MAX_HEIGHT;
+            leftWidth = totalWidth;
+
+            this.leftBox.set_width(leftWidth);
+            this.previewBox.visible = false;
+        }
+
+        this.actor.set_width(totalWidth);
+        this.actor.set_height(totalHeight);
+
+        if (fullscreen) {
+            this.actor.set_width(monitor.width);
+            this.actor.set_height(monitor.height);
+            this.actor.set_position(monitor.x, monitor.y);
+            this.leftBox.set_width(monitor.width);
+            this.previewBox.visible = false;
+        } else if (showPreview) {
+            this.actor.set_position(
+                monitor.x + Math.floor((monitor.width - totalWidth) / 2),
+                monitor.y + Math.floor((monitor.height - totalHeight) / 2)
+            );
+        } else {
+            this.actor.set_position(
+                monitor.x + Math.floor((monitor.width - totalWidth) / 2),
+                monitor.y + Math.floor(monitor.height / 6)
+            );
+        }
+
+        return {
+            previewWidth,
+            previewHeight: totalHeight,
+        };
+    }
+
+    renderResults(items, tokens, selectedIndex, selectedIds, modeName, multi) {
+        this.resultsBox.remove_all_children();
+        this._rowActors = [];
+
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+
+            const row = new St.BoxLayout({
+                vertical: false,
+                style_class: 'dmenu-result-row',
+                x_expand: true,
+                reactive: true,
+                track_hover: true,
+            });
+
+            const marker = new St.Label({
+                text: multi && selectedIds.has(item.id) ? '●' : '',
+                style_class: 'dmenu-marker',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            const pinMarker = new St.Label({
+                text: modeName === 'drun' && item.pinned ? '📌' : '',
+                style_class: 'dmenu-pin-marker',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            let iconActor = null;
+            if (item.icon) {
+                iconActor = new St.Icon({
+                    gicon: item.icon,
+                    style_class: 'dmenu-icon',
+                    y_align: Clutter.ActorAlign.CENTER,
+                });
+            }
+
+            const label = new St.Label({
+                style_class: i === selectedIndex
+                    ? 'dmenu-result dmenu-result-selected'
+                    : 'dmenu-result',
+                x_expand: true,
+                x_align: Clutter.ActorAlign.FILL,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            label.clutter_text.set_markup(
+                highlightLabel(item.label, tokens)
+            );
+
+            row.add_child(marker);
+            row.add_child(pinMarker);
+
+            if (iconActor)
+                row.add_child(iconActor);
+
+            row.add_child(label);
+
+            row.connect('enter-event', () => {
+                label.add_style_class_name('dmenu-result-hover');
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            row.connect('leave-event', () => {
+                label.remove_style_class_name('dmenu-result-hover');
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            const rowIndex = i;
+
+            row.connect('button-press-event', (actor, event) => {
+                const button = event.get_button();
+
+                if (button === Clutter.BUTTON_SECONDARY) {
+                    this._controller.openContextMenu(item, row);
+                    return Clutter.EVENT_STOP;
+                }
+
+                if (button === Clutter.BUTTON_PRIMARY) {
+                    label.remove_style_class_name('dmenu-result-hover');
+                    label.add_style_class_name('dmenu-result-clicked');
+                    this._controller.selectIndex(rowIndex);
+
+                    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                        this._controller.activate();
+                        return GLib.SOURCE_REMOVE;
+                    });
+
+                    return Clutter.EVENT_STOP;
+                }
+
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            this.resultsBox.add_child(row);
+            this._rowActors.push(row);
+        }
+
+        this.scrollSelectedIntoView(selectedIndex);
+    }
+
+    renderPinnedApps(apps) {
+        this.pinnedBar.remove_all_children();
+
+        if (!apps || apps.length === 0) {
+            this.pinnedBar.hide();
+            return;
+        }
+
+        this.pinnedBar.show();
+
+        for (const app of apps) {
+            const button = new St.Button({
+                style_class: 'dmenu-pinned-icon',
+                child: new St.Icon({
+                    gicon: app.get_icon(),
+                    icon_size: 48,
+                }),
+                reactive: true,
+                can_focus: true,
+                track_hover: true,
+            });
+
+            button.connect('clicked', () => {
+                this._controller.activatePinnedApp(app);
+            });
+
+            button.connect('button-press-event', (actor, event) => {
+                if (event.get_button() === Clutter.BUTTON_SECONDARY) {
+                    this._controller.openContextMenuForApp(app, button);
+                    return Clutter.EVENT_STOP;
+                }
+
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            this.pinnedBar.add_child(button);
+        }
+    }
+
+    clearPinnedApps() {
+        this.pinnedBar.hide();
+        this.pinnedBar.remove_all_children();
+    }
+
+    scrollSelectedIntoView(index) {
         if (this._rowActors.length === 0)
             return;
 
-        const selectedRow = this._rowActors[this._selectedIndex];
+        const selectedRow = this._rowActors[index];
         if (!selectedRow)
             return;
 
-        const SCROLL_TIME = 0.15;
+        const isOpen = () => this._controller.isOpen;
+        const scrollView = this.resultsContainer;
 
-        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-            if (!this._isOpen || !this._rowActors.includes(selectedRow))
+        this._scrollIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._scrollIdleId = null;
+
+            if (!isOpen() || !this._rowActors.includes(selectedRow))
                 return GLib.SOURCE_REMOVE;
 
-            const scrollView = this.results_container;
             const adjustment = scrollView.vadjustment;
-
             if (!adjustment)
                 return GLib.SOURCE_REMOVE;
 
@@ -641,13 +1245,12 @@ const DmenuUI = class {
             const currentValue = adjustment.value;
             let newValue = currentValue;
 
-            if (y1 < currentValue + offset) {
+            if (y1 < currentValue + offset)
                 newValue = y1 - offset;
-            } else if (y2 > currentValue + pageSize - offset) {
+            else if (y2 > currentValue + pageSize - offset)
                 newValue = y2 + offset - pageSize;
-            } else {
+            else
                 return GLib.SOURCE_REMOVE;
-            }
 
             const maxValue = Math.max(lower, upper - pageSize);
             newValue = Math.max(lower, Math.min(newValue, maxValue));
@@ -668,22 +1271,169 @@ const DmenuUI = class {
         });
     }
 
-    _onTextChanged() {
-        if (this._filterTimeoutId)
-            GLib.source_remove(this._filterTimeoutId);
+    _handleTextChanged() {
+        this._controller.scheduleSearchUpdate();
+    }
+}
 
-        this._filterTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FILTER_DEBOUNCE_MS, () => {
-            this._closeOpenMenu();
-            this._selectedIndex = 0;
-            this._updateResults();
-            this._filterTimeoutId = null;
-            return GLib.SOURCE_REMOVE;
+// ============================================================
+// MAIN CONTROLLER
+// ============================================================
+
+class DmenuController {
+    constructor(service) {
+        this._service = service;
+
+        this._search = new SearchModel();
+        this._selection = new SelectionModel();
+
+        this._windowMode = new WindowMode(this);
+        this._drunMode = new DrunMode(this);
+        this._pathMode = new PathMode(this);
+        this._customMode = new CustomMode(this);
+
+        this._mode = this._customMode;
+        this._modeName = 'stdin';
+
+        this._view = new DmenuView(this);
+        this._appMenu = new AppMenuController(this._view.actor);
+        this._preview = new WindowPreview(
+            this._view.previewBox,
+            window => this._windowMode.handleClosedWindow(window)
+        );
+
+        this._isOpen = false;
+        this._multi = false;
+        this._fullscreen = false;
+        this._filterTimeoutId = null;
+        this._showPreview = false;
+        this._previewWidth = 0;
+        this._previewHeight = 0;
+
+        this._favoritesChangedId = this._drunMode.isFavoriteChangedListener(() => {
+            if (!this._isOpen || this._modeName !== 'drun')
+                return;
+
+            this._syncPinnedItems();
+            this._render();
         });
     }
 
-    _onKeyPress(actor, event) {
+    get isOpen() {
+        return this._isOpen;
+    }
+
+    show(items, multi = false, hint = null, fullscreen = false) {
+        this._open(
+            'stdin',
+            this._customMode,
+            this._customMode.getItems(items),
+            multi,
+            hint,
+            fullscreen
+        );
+    }
+
+    showApps(multi = false, hint = null, fullscreen = false) {
+        this._open(
+            'drun',
+            this._drunMode,
+            this._drunMode.getItems(),
+            multi,
+            hint,
+            fullscreen
+        );
+    }
+
+    showWindows(multi = false, hint = null, fullscreen = false) {
+        this._open(
+            'window',
+            this._windowMode,
+            this._windowMode.getItems(),
+            multi,
+            hint,
+            fullscreen
+        );
+    }
+
+    showPaths(paths, multi = false, hint = null, fullscreen = false) {
+        this._open(
+            'paths',
+            this._pathMode,
+            this._pathMode.getItems(paths),
+            multi,
+            hint,
+            fullscreen
+        );
+    }
+
+    hide() {
+        this._closeInternal();
+    }
+
+    destroy() {
+        this._closeInternal();
+
+        if (this._favoritesChangedId) {
+            this._drunMode.disconnectFavoriteListener(this._favoritesChangedId);
+            this._favoritesChangedId = 0;
+        }
+
+        this._preview.destroy();
+        this._view.destroy();
+    }
+
+    selectIndex(index) {
+        const count = this._search.visibleItems.length;
+        if (count === 0)
+            return;
+
+        this._selection.index = Math.max(0, Math.min(index, count - 1));
+        this._render();
+    }
+
+    removeItemByData(data) {
+        const removed = this._search.removeItemByData(data);
+        if (!removed)
+            return;
+
+        const visible = this._search.setQuery(this._view.getQuery());
+        this._selection.clamp(visible.length);
+        this._selection.selectedIds.forEach(id => {
+            if (!this._search.allItems.some(item => item.id === id))
+                this._selection.selectedIds.delete(id);
+        });
+
+        this._render();
+    }
+
+    scheduleSearchUpdate() {
+        if (this._filterTimeoutId)
+            GLib.source_remove(this._filterTimeoutId);
+
+        this._filterTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            FILTER_DEBOUNCE_MS,
+            () => {
+                this._filterTimeoutId = null;
+
+                if (!this._isOpen)
+                    return GLib.SOURCE_REMOVE;
+
+                this._appMenu.close();
+                this._selection.index = 0;
+                this._search.setQuery(this._view.getQuery());
+                this._render();
+
+                return GLib.SOURCE_REMOVE;
+            }
+        );
+    }
+
+    handleKeyPress(actor, event) {
         const sym = event.get_key_symbol();
         const mods = event.get_state();
+        const visibleCount = this._search.visibleItems.length;
 
         if (sym === Clutter.KEY_Escape) {
             this._service.emitCancelled();
@@ -692,557 +1442,80 @@ const DmenuUI = class {
         }
 
         if (sym === Clutter.KEY_Down) {
-            if (this._visibleItems.length > 0) {
-                this._closeOpenMenu();
-                this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
+            if (visibleCount > 0) {
+                this._appMenu.close();
+                this._selection.moveDown(visibleCount);
                 this._render();
             }
             return Clutter.EVENT_STOP;
         }
 
         if (sym === Clutter.KEY_Up) {
-            if (this._visibleItems.length > 0) {
-                this._closeOpenMenu();
-                this._selectedIndex = Math.max(0, this._selectedIndex - 1);
+            if (visibleCount > 0) {
+                this._appMenu.close();
+                this._selection.moveUp(visibleCount);
                 this._render();
             }
             return Clutter.EVENT_STOP;
         }
 
-        if (this._actionMode === 'drun' && sym === Clutter.KEY_p &&
+        if (this._modeName === 'drun' &&
+            sym === Clutter.KEY_p &&
             (mods & Clutter.ModifierType.CONTROL_MASK)) {
             this._togglePinCurrent();
             return Clutter.EVENT_STOP;
         }
 
-        if (this._multiSelectEnabled) {
-            if (sym === Clutter.KEY_Tab) {
-                this._toggleCurrent();
-                if (this._visibleItems.length > 0)
-                    this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
-                this._render();
-                return Clutter.EVENT_STOP;
-            }
+        if (!this._multi)
+            return Clutter.EVENT_PROPAGATE;
 
-            if (sym === Clutter.KEY_space && (mods & Clutter.ModifierType.CONTROL_MASK)) {
-                this._toggleCurrent();
-                this._render();
-                return Clutter.EVENT_STOP;
-            }
+        if (sym === Clutter.KEY_Tab) {
+            this._toggleCurrent();
+            this._selection.next(visibleCount);
+            this._render();
+            return Clutter.EVENT_STOP;
+        }
 
-            if ((sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) &&
-                (mods & Clutter.ModifierType.SHIFT_MASK)) {
-                this._toggleCurrent();
-                if (this._visibleItems.length > 0)
-                    this._selectedIndex = Math.min(this._visibleItems.length - 1, this._selectedIndex + 1);
-                this._render();
-                return Clutter.EVENT_STOP;
-            }
+        if (sym === Clutter.KEY_space &&
+            (mods & Clutter.ModifierType.CONTROL_MASK)) {
+            this._toggleCurrent();
+            this._render();
+            return Clutter.EVENT_STOP;
+        }
+
+        if ((sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) &&
+            (mods & Clutter.ModifierType.SHIFT_MASK)) {
+            this._toggleCurrent();
+            this._selection.next(visibleCount);
+            this._render();
+            return Clutter.EVENT_STOP;
         }
 
         return Clutter.EVENT_PROPAGATE;
     }
 
-    _toggleCurrent() {
-        if (!this._multiSelectEnabled)
-            return;
-
-        if (this._visibleItems.length === 0 || this._selectedIndex >= this._visibleItems.length)
-            return;
-
-        const item = this._visibleItems[this._selectedIndex];
-        const id = item.id;
-
-        if (this._selectedItems.has(id))
-            this._selectedItems.delete(id);
-        else
-            this._selectedItems.add(id);
-    }
-
-    _togglePinCurrent() {
-        if (this._actionMode !== 'drun')
-            return;
-
-        if (this._visibleItems.length === 0 || this._selectedIndex >= this._visibleItems.length)
-            return;
-
-        const item = this._visibleItems[this._selectedIndex];
-        const favorites = AppFavorites.getAppFavorites();
-
-        if (favorites.isFavorite(item.id))
-            favorites.removeFavorite(item.id);
-        else
-            favorites.addFavorite(item.id);
-    }
-
-    _refreshAppOrdering() {
-        if (this._actionMode !== 'drun' || !this._appFavorites)
-            return;
-
-        const keepId = this._visibleItems[this._selectedIndex]
-            ? this._visibleItems[this._selectedIndex].id
-            : null;
-
-        const favoriteIdSet = new Set(this._appFavorites.getFavorites().map(a => a.get_id()));
-
-        for (const item of this._allItems)
-            item.pinned = favoriteIdSet.has(item.id);
-
-        this._updateResults();
-
-        if (keepId) {
-            const idx = this._visibleItems.findIndex(i => i.id === keepId);
-            this._selectedIndex = idx !== -1 ? idx : 0;
-        }
-
-        this._render();
-    }
-
-    _renderPinnedBar() {
-        this.pinned_bar.remove_all_children();
-
-        if (this._actionMode !== 'drun' || !this._appFavorites) {
-            this.pinned_bar.hide();
-            return;
-        }
-
-        const favorites = this._appFavorites.getFavorites();
-        if (favorites.length === 0) {
-            this.pinned_bar.hide();
-            return;
-        }
-
-        this.pinned_bar.show();
-
-        for (const app of favorites) {
-            const button = new St.Button({
-                style_class: 'dmenu-pinned-icon',
-                child: new St.Icon({ gicon: app.get_icon(), icon_size: 48 }),
-                reactive: true,
-                can_focus: true,
-                track_hover: true,
-            });
-
-            button.connect('clicked', () => this._launchPinnedApp(app));
-
-            button.connect('button-press-event', (actor, event) => {
-                if (event.get_button() === Clutter.BUTTON_SECONDARY) {
-                    this._closeOpenMenu();
-                    const menu = this._createAppMenu(button, app);
-                    this._openMenu = menu;
-                    menu.open(true);
-                    return Clutter.EVENT_STOP;
-                }
-                return Clutter.EVENT_PROPAGATE;
-            });
-
-            this.pinned_bar.add_child(button);
-        }
-    }
-
-    _launchPinnedApp(app) {
-        try {
-            app.launch([], null);
-        } catch (e) {
-            journal(`Failed to launch ${app.get_name()}: ${e.message}`, true);
-        }
-
-        this._service.emitSelected([app.get_name()]);
-        this.hide();
-    }
-
-    _closeOpenMenu() {
-        if (this._openMenu) {
-            this._openMenu.close();
-            this._openMenu = null;
-        }
-    }
-
-    _createAppMenu(sourceActor, app) {
-        const menu = new AppMenu(sourceActor, St.Side.BOTTOM, {
-            favoritesSection: true,
-            showSingleWindows: true,
-        });
-
-        menu.actor.add_style_class_name('dmenu-context-menu');
-
-        Main.layoutManager.addChrome(menu.actor);
-        menu.actor.hide();
-        this._menuManager.addMenu(menu);
-
-        menu.setApp(app);
-
-        menu.connect('open-state-changed', (o, isOpen) => {
-            if (!isOpen) {
-                if (menu === this._openMenu)
-                    this._openMenu = null;
-                menu.destroy();
-            }
-        });
-
-        return menu;
-    }
-
-    // ---------- Preview handling ----------
-
-    _clearPreview() {
-        if (this._previewWindow && this._previewUnmanagedId) {
-            this._previewWindow.disconnect(this._previewUnmanagedId);
-            this._previewUnmanagedId = 0;
-        }
-
-        if (this._previewOverlay) {
-            this._previewOverlay.destroy();
-            this._previewOverlay = null;
-            this._previewClone = null;
-            this._previewTitle = null;
-            this._previewCloseButton = null;
-        } else if (this._previewClone) {
-            this._previewClone.destroy();
-            this._previewClone = null;
-        }
-
-        this._previewWindow = null;
-        this._previewWindowId = 0;
-        this._previewBox.remove_all_children();
-    }
-
-    _removeClosedWindow(window) {
-        if (!window)
-            return;
-
-        const windowId = window.get_id();
-
-        // Remove the closed window from the master list.
-        this._allItems = this._allItems.filter(item => {
-            return item.data !== window && String(item.id) !== String(windowId);
-        });
-
-        // Recalculate fuzzy-search results using the updated master list.
-        this._updateResults();
-
-        // Keep selection valid.
-        if (this._visibleItems.length === 0) {
-            this._selectedIndex = 0;
-            this._clearPreview();
-            return;
-        }
-
-        if (this._selectedIndex >= this._visibleItems.length)
-            this._selectedIndex = this._visibleItems.length - 1;
-
-        // Render again with the corrected selection.
-        this._render();
-    }
-
-    _updatePreview() {
-        if (!this._showPreview || !this._isOpen || this._visibleItems.length === 0) {
-            this._clearPreview();
-            return;
-        }
-
-        const item = this._visibleItems[this._selectedIndex];
-
-        if (!item || !item.data) {
-            this._clearPreview();
-            return;
-        }
-
-        const window = item.data;
-
-        if (!(window instanceof Meta.Window)) {
-            this._clearPreview();
-            return;
-        }
-
-        // If the window changed, clear old preview
-        if (this._previewWindow !== window) {
-            this._clearPreview();
-
-            this._previewWindow = window;
-            this._previewWindowId = window.get_id();
-
-            this._previewUnmanagedId = window.connect('unmanaged', () => {
-                journal(`[WindowPreview] Window closed: ${window.get_title()}`);
-
-                this._clearPreview();
-
-                this._removeClosedWindow(window);
-            });
-        }
-
-        const actor = window.get_compositor_private();
-
-        if (!actor) {
-            this._clearPreview();
-            return;
-        }
-
-        // Get preview area dimensions BEFORE using them.
-        // This avoids:
-        // ReferenceError: can't access lexical declaration 'previewWidth'
-        const previewWidth = this._previewBoxWidth;
-        const previewHeight = this._previewBoxHeight;
-
-        if (previewWidth <= 0 || previewHeight <= 0)
-            return;
-
-        // ------------------------------------------------------------
-        // Create preview hierarchy
-        // ------------------------------------------------------------
-
-        if (!this._previewOverlay) {
-            // Overlay covers the entire preview box.
-            // Clone, title, and close button are positioned inside it.
-            this._previewOverlay = new Clutter.Actor({
-                width: previewWidth,
-                height: previewHeight,
-                reactive: true,
-            });
-
-            // Window clone
-            this._previewClone = new Clutter.Clone({
-                source: actor,
-            });
-
-            // --------------------------------------------------------
-            // Window title
-            // --------------------------------------------------------
-
-            this._previewTitle = new St.Label({
-                style_class: 'window-preview-title',
-                text: window.get_title() || 'Untitled',
-                x_align: Clutter.ActorAlign.FILL,
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-
-            // Center the actual text inside the label.
-            this._previewTitle.clutter_text.set_x_align(
-                Clutter.ActorAlign.CENTER
-            );
-
-            this._previewTitle.clutter_text.set_y_align(
-                Clutter.ActorAlign.CENTER
-            );
-
-            // Allow long titles to wrap to multiple lines.
-            this._previewTitle.clutter_text.set_line_wrap(true);
-
-            this._previewTitle.clutter_text.set_line_wrap_mode(
-                Pango.WrapMode.WORD_CHAR
-            );
-
-            // Do not ellipsize the title.
-            this._previewTitle.clutter_text.set_ellipsize(
-                Pango.EllipsizeMode.NONE
-            );
-
-            // Large + bold + readable.
-            this._previewTitle.set_style(
-                'font-size: 32px;' +
-                'font-weight: bold;' +
-                'color: white;' +
-                'background-color: rgba(0, 0, 0, 0.55);' +
-                'padding: 8px 16px;'
-            );
-
-            // --------------------------------------------------------
-            // Close button
-            // --------------------------------------------------------
-
-            this._previewCloseButton = new St.Button({
-                style_class: 'window-close-button',
-                child: new St.Icon({
-                    icon_name: 'window-close-symbolic',
-                    icon_size: 32,
-                }),
-                reactive: true,
-                can_focus: true,
-                track_hover: true,
-            });
-
-            this._previewCloseButton.connect('clicked', () => {
-                try {
-                    const currentWindow = this._previewWindow;
-
-                    if (currentWindow)
-                        currentWindow.delete(global.get_current_time());
-                } catch (e) {
-                    journal(
-                        `Failed to close preview window: ${e.message}`,
-                        true
-                    );
-                }
-
-                return Clutter.EVENT_STOP;
-            });
-
-            // --------------------------------------------------------
-            // Build hierarchy
-            // --------------------------------------------------------
-
-            this._previewOverlay.add_child(this._previewClone);
-            this._previewOverlay.add_child(this._previewTitle);
-            this._previewOverlay.add_child(this._previewCloseButton);
-
-            this._previewBox.add_child(this._previewOverlay);
-        } else {
-            // Existing preview — update source and title.
-            this._previewClone.source = actor;
-
-            this._previewTitle.text = window.get_title() || 'Untitled';
-        }
-
-        // Keep overlay synced to current preview size.
-        this._previewOverlay.set_size(
-            previewWidth,
-            previewHeight
-        );
-
-        // ------------------------------------------------------------
-        // Determine source dimensions
-        // ------------------------------------------------------------
-
-        let srcWidth = actor.width || 0;
-        let srcHeight = actor.height || 0;
-
-        if (srcWidth === 0 || srcHeight === 0) {
-            const rect = window.get_frame_rect();
-
-            srcWidth = rect.width;
-            srcHeight = rect.height;
-        }
-
-        if (srcWidth === 0 || srcHeight === 0) {
-            srcWidth = 100;
-            srcHeight = 100;
-        }
-
-        // ------------------------------------------------------------
-        // Scale window to fit preview area
-        // ------------------------------------------------------------
-
-        const scaleX = previewWidth / srcWidth;
-        const scaleY = previewHeight / srcHeight;
-
-        const scale = Math.min(
-            scaleX,
-            scaleY,
-            1.0
-        );
-
-        const targetWidth = srcWidth * scale;
-        const targetHeight = srcHeight * scale;
-
-        // ------------------------------------------------------------
-        // Position clone
-        // ------------------------------------------------------------
-
-        const cloneX = (previewWidth - targetWidth) / 2;
-        const cloneY = (previewHeight - targetHeight) / 2;
-
-        this._previewClone.set_size(
-            targetWidth,
-            targetHeight
-        );
-
-        this._previewClone.set_position(
-            cloneX,
-            cloneY
-        );
-
-        // ------------------------------------------------------------
-        // Position title
-        // ------------------------------------------------------------
-
-        // Keep title centered over the actual cloned window,
-        // not the entire preview box.
-        //
-        // The title gets enough height for multiple wrapped lines.
-        const titleHeight = Math.min(
-            140,
-            Math.max(60, targetHeight * 0.25)
-        );
-
-        this._previewTitle.set_size(
-            targetWidth,
-            titleHeight
-        );
-
-        this._previewTitle.set_position(
-            cloneX,
-            cloneY + (targetHeight / 2) - (titleHeight / 2)
-        );
-
-        // ------------------------------------------------------------
-        // Position close button
-        // ------------------------------------------------------------
-
-        const closeButtonSize = 48;
-        const closeMargin = 10;
-
-        this._previewCloseButton.set_size(
-            closeButtonSize,
-            closeButtonSize
-        );
-
-        this._previewCloseButton.set_position(
-            cloneX + targetWidth - closeButtonSize - closeMargin,
-            cloneY + closeMargin
-        );
-    }
-
-    // ---------- Activation ----------
-
-    _activate() {
+    activate() {
+        const selectedItems = this._getActivationItems();
         let resultLabels = [];
-        let selectedItems = [];
-
-        if (this._multiSelectEnabled && this._selectedItems.size > 0) {
-            selectedItems = this._visibleItems.filter(item =>
-                this._selectedItems.has(item.id)
-            );
-        } else if (this._visibleItems.length > 0 && this._selectedIndex < this._visibleItems.length) {
-            selectedItems = [this._visibleItems[this._selectedIndex]];
-        } else if (this.entry.get_text()) {
-            resultLabels = [this.entry.get_text()];
-        }
 
         if (selectedItems.length > 0) {
-            if (this._actionMode === 'drun') {
-                for (const item of selectedItems) {
-                    const app = item.data;
-                    if (app && typeof app.launch === 'function') {
-                        try {
-                            app.launch([], null);
-                        } catch (e) {
-                            journal(`Failed to launch ${item.label}: ${e.message}`, true);
-                        }
-                    }
-                }
+            if (this._modeName === 'drun') {
+                selectedItems.forEach(item => this._drunMode.activate(item));
                 resultLabels = selectedItems.map(item => item.label);
-            } else if (this._actionMode === 'window') {
-                const timestamp = global.get_current_time();
-                for (const item of selectedItems) {
-                    const win = item.data;
-                    if (win) {
-                        try {
-                            const workspace = win.get_workspace();
-                            if (workspace)
-                                workspace.activate_with_focus(win, timestamp);
-                            else
-                                win.activate(timestamp);
-                        } catch (e) {
-                            journal(`Failed to activate window ${item.label}: ${e.message}`, true);
-                        }
-                    }
-                }
+            } else if (this._modeName === 'window') {
+                selectedItems.forEach(item => this._windowMode.activate(item));
                 resultLabels = selectedItems.map(item => item.label);
-            } else if (this._actionMode === 'paths') {
-                resultLabels = selectedItems.map(item => item.data);
+            } else if (this._modeName === 'paths') {
+                resultLabels = selectedItems
+                    .map(item => this._pathMode.activate(item))
+                    .filter(value => value !== null && value !== undefined);
             } else {
-                resultLabels = selectedItems.map(item => item.label);
+                resultLabels = selectedItems
+                    .map(item => this._customMode.activate(item))
+                    .filter(value => value !== null && value !== undefined);
             }
+        } else if (this._view.getQuery()) {
+            resultLabels = [this._view.getQuery()];
         }
 
         if (resultLabels.length > 0)
@@ -1253,158 +1526,323 @@ const DmenuUI = class {
         this.hide();
     }
 
-    _updateResults() {
-        const filter = this.entry.get_text().trim().toLowerCase();
-        const tokens = filter.split(/\s+/).filter(t => t.length > 0);
+    activatePinnedApp(app) {
+        this._drunMode.activatePinned(app);
+        this._service.emitSelected([app.get_name()]);
+        this.hide();
+    }
 
-        this._filterTokens = tokens;
+    openContextMenu(item, sourceActor) {
+        if (this._modeName !== 'drun')
+            return;
 
-        this._visibleItems = tokens.length === 0
-            ? this._allItems
-            : this._allItems.filter(item => {
-                const lower = item.label.toLowerCase();
-                return tokens.every(tok => lower.includes(tok));
-            });
+        if (!item?.shellApp) {
+            journal(`No Shell.App available for ${item?.label || 'unknown item'}`, true);
+            return;
+        }
 
+        this._appMenu.openForApp(sourceActor, item.shellApp);
+    }
+
+    openContextMenuForApp(app, sourceActor) {
+        this._appMenu.openForApp(sourceActor, app);
+    }
+
+    _open(modeName, mode, items, multi, hint, fullscreen) {
+        if (this._isOpen)
+            this._closeInternal();
+
+        this._modeName = modeName;
+        this._mode = mode;
+        this._multi = multi;
+        this._fullscreen = fullscreen;
+        this._isOpen = true;
+
+        this._search.setItems(items);
+        this._selection.reset();
+
+        this._showPreview = modeName === 'window' && !fullscreen;
+
+        this._view.cancelPendingWork();
+        this._view.resetInput();
+        this._setHint(hint);
+
+        const layout = this._view.configureLayout(
+            this._showPreview,
+            fullscreen
+        );
+
+        this._previewWidth = layout.previewWidth;
+        this._previewHeight = layout.previewHeight;
+
+        Main.layoutManager.addChrome(this._view.actor, {
+            affectsInputRegion: true,
+        });
+
+        this._view.focusInput(this._isOpen);
+        this._renderPinnedBar();
+        this._search.setQuery('');
         this._render();
     }
 
-    _render() {
-        this.results_box.remove_all_children();
-        this._rowActors = [];
-
-        for (let i = 0; i < this._visibleItems.length; i++) {
-            const item = this._visibleItems[i];
-
-            const row = new St.BoxLayout({
-                vertical: false,
-                style_class: 'dmenu-result-row',
-                x_expand: true,
-                reactive: true,
-                track_hover: true,
-            });
-
-            const markerText = this._multiSelectEnabled && this._selectedItems.has(item.id)
-                ? '●'
-                : '';
-
-            const marker = new St.Label({
-                text: markerText,
-                style_class: 'dmenu-marker',
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-
-            const pinMarker = new St.Label({
-                text: (this._actionMode === 'drun' && item.pinned) ? '📌' : '',
-                style_class: 'dmenu-pin-marker',
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-
-            let iconActor = null;
-            if (item.icon) {
-                iconActor = new St.Icon({
-                    gicon: item.icon,
-                    style_class: 'dmenu-icon',
-                    y_align: Clutter.ActorAlign.CENTER,
-                });
-            }
-
-            const markup = highlightLabel(item.label, this._filterTokens);
-
-            const label = new St.Label({
-                style_class: i === this._selectedIndex
-                    ? 'dmenu-result dmenu-result-selected'
-                    : 'dmenu-result',
-                x_expand: true,
-                x_align: Clutter.ActorAlign.FILL,
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-
-            label.clutter_text.set_markup(markup);
-
-            row.add_child(marker);
-            row.add_child(pinMarker);
-
-            if (iconActor)
-                row.add_child(iconActor);
-
-            row.add_child(label);
-
-            row.connect('enter-event', () => {
-                label.add_style_class_name('dmenu-result-hover');
-                return Clutter.EVENT_PROPAGATE;
-            });
-
-            row.connect('leave-event', () => {
-                label.remove_style_class_name('dmenu-result-hover');
-                return Clutter.EVENT_PROPAGATE;
-            });
-
-            const rowIndex = i;
-
-            row.connect('button-press-event', (actor, event) => {
-                const button = event.get_button();
-
-                if (button === Clutter.BUTTON_SECONDARY) {
-                    if (this._actionMode !== 'drun')
-                        return Clutter.EVENT_PROPAGATE;
-
-                    const app = item.shellApp;
-
-                    if (!app) {
-                        journal(`No Shell.App available for ${item.label}`, true);
-                        return Clutter.EVENT_STOP;
-                    }
-
-                    this._closeOpenMenu();
-
-                    const menu = this._createAppMenu(row, app);
-                    this._openMenu = menu;
-                    menu.open(true);
-
-                    return Clutter.EVENT_STOP;
-                }
-
-                if (button === Clutter.BUTTON_PRIMARY) {
-                    label.remove_style_class_name('dmenu-result-hover');
-                    label.add_style_class_name('dmenu-result-clicked');
-                    this._selectedIndex = rowIndex;
-
-                    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-                        this._activate();
-                        return GLib.SOURCE_REMOVE;
-                    });
-
-                    return Clutter.EVENT_STOP;
-                }
-
-                return Clutter.EVENT_PROPAGATE;
-            });
-
-            this.results_box.add_child(row);
-            this._rowActors.push(row);
+    _closeInternal() {
+        if (this._filterTimeoutId) {
+            GLib.source_remove(this._filterTimeoutId);
+            this._filterTimeoutId = null;
         }
 
-        this._scrollSelectedIntoView();
+        this._view.cancelPendingWork();
+        this._appMenu.close();
+        this._preview.hide();
 
-        // Update preview after rendering
-        if (this._showPreview) {
-            this._updatePreview();
+        if (!this._isOpen)
+            return;
+
+        this._view.clearPinnedApps();
+        Main.layoutManager.removeChrome(this._view.actor);
+        this._isOpen = false;
+
+        this._search.setItems([]);
+        this._selection.reset();
+    }
+
+    _setHint(hint) {
+        if (hint) {
+            this._view.setHint(hint);
+            return;
+        }
+
+        if (this._modeName === 'drun') {
+            this._view.setHint(
+                'Type to filter · Enter: launch · Ctrl+P: pin/unpin · Super/Esc: cancel'
+            );
+        } else if (this._multi) {
+            this._view.setHint(
+                'Type to filter · Enter: select · Tab: multi-select · Esc: cancel'
+            );
+        } else {
+            this._view.setHint(
+                'Type to filter · Enter: select · Esc: cancel'
+            );
         }
     }
-};
+
+    _render() {
+        const items = this._search.visibleItems;
+
+        this._view.renderResults(
+            items,
+            this._search.tokens,
+            this._selection.index,
+            this._selection.selectedIds,
+            this._modeName,
+            this._multi
+        );
+
+        if (this._showPreview && items.length > 0) {
+            const selectedItem = items[this._selection.index];
+
+            if (selectedItem?.data instanceof Meta.Window) {
+                this._preview.show(
+                    selectedItem.data,
+                    this._previewWidth,
+                    this._previewHeight
+                );
+            } else {
+                this._preview.hide();
+            }
+        } else {
+            this._preview.hide();
+        }
+    }
+
+    _renderPinnedBar() {
+        if (this._modeName !== 'drun') {
+            this._view.clearPinnedApps();
+            return;
+        }
+
+        this._view.renderPinnedApps(this._drunMode.getFavorites());
+    }
+
+    _syncPinnedItems() {
+        if (this._modeName !== 'drun')
+            return;
+
+        const favoriteIds = new Set(
+            this._drunMode.getFavorites().map(app => app.get_id())
+        );
+
+        for (const item of this._search.allItems)
+            item.pinned = favoriteIds.has(item.id);
+
+        this._renderPinnedBar();
+    }
+
+    _togglePinCurrent() {
+        const items = this._search.visibleItems;
+        if (items.length === 0)
+            return;
+
+        const item = items[this._selection.index];
+        if (!item)
+            return;
+
+        this._drunMode.togglePin(item);
+    }
+
+    _toggleCurrent() {
+        const items = this._search.visibleItems;
+        if (items.length === 0)
+            return;
+
+        this._selection.toggle(items[this._selection.index]);
+    }
+
+    _getActivationItems() {
+        const items = this._search.visibleItems;
+
+        if (this._multi && this._selection.selectedIds.size > 0)
+            return this._selection.getSelectedItems(items);
+
+        if (items.length > 0 && this._selection.index < items.length)
+            return [items[this._selection.index]];
+
+        return [];
+    }
+}
+
+// ============================================================
+// DBUS SERVICE
+// ============================================================
+
+class DmenuService {
+    constructor(extension) {
+        this._extension = extension;
+        this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(
+            DBUS_INTERFACE,
+            this
+        );
+        this._ownerId = null;
+    }
+
+    Show(items, multi, hint, fullscreen) {
+        this._extension.show(items, multi, hint, fullscreen);
+    }
+
+    ShowApps(multi, hint, fullscreen) {
+        this._extension.showApps(multi, hint, fullscreen);
+    }
+
+    ShowWindows(multi, hint, fullscreen) {
+        this._extension.showWindows(multi, hint, fullscreen);
+    }
+
+    ShowPaths(paths, multi, hint, fullscreen) {
+        this._extension.showPaths(paths, multi, hint, fullscreen);
+    }
+
+    emitSelected(items) {
+        this._dbusImpl.emit_signal(
+            'Selected',
+            GLib.Variant.new('(as)', [items])
+        );
+    }
+
+    emitCancelled() {
+        this._dbusImpl.emit_signal('Cancelled', null);
+    }
+
+    export() {
+        this._unexportInterface();
+
+        if (this._ownerId) {
+            Gio.bus_unown_name(this._ownerId);
+            this._ownerId = null;
+        }
+
+        this._ownerId = Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            BUS_NAME,
+            Gio.BusNameOwnerFlags.NONE,
+            connection => {
+                try {
+                    this._dbusImpl.export(connection, OBJECT_PATH);
+                    journal(`D-Bus interface exported on ${OBJECT_PATH}`);
+                    this._exported = true;
+                } catch (e) {
+                    journal(
+                        `Failed to export D-Bus interface: ${e.message}`,
+                        true
+                    );
+                    this._exported = false;
+                }
+            },
+            (connection, name) => {
+                journal(`${name}: name acquired`);
+            },
+            (connection, name) => {
+                journal(
+                    `${name}: name lost — another instance may already own it`,
+                    true
+                );
+                this._unexportInterface();
+                this._ownerId = null;
+            }
+        );
+    }
+
+    unexport() {
+        if (this._ownerId) {
+            Gio.bus_unown_name(this._ownerId);
+            this._ownerId = null;
+        }
+
+        this._unexportInterface();
+    }
+
+    _unexportInterface() {
+        try {
+            if (this._dbusImpl) {
+                this._dbusImpl.unexport();
+                this._exported = false;
+            }
+        } catch (e) {
+            if (!e.message.includes('not exported')) {
+                journal(
+                    `Failed to unexport D-Bus interface: ${e.message}`,
+                    true
+                );
+            }
+        }
+    }
+}
+
+// ============================================================
+// GNOME SHELL EXTENSION
+// ============================================================
 
 export default class SimpleDmenuExtension extends Extension {
     _writeSpecCache() {
         try {
             GLib.mkdir_with_parents(SPEC_CACHE_DIR, 0o755);
+
             const spec = {
                 bus_name: BUS_NAME,
                 object_path: OBJECT_PATH,
                 xml: DBUS_INTERFACE,
             };
-            const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, SPEC_CACHE_FILE]);
-            GLib.file_set_contents(filePath, JSON.stringify(spec, null, 2));
+
+            const filePath = GLib.build_filenamev([
+                SPEC_CACHE_DIR,
+                SPEC_CACHE_FILE,
+            ]);
+
+            GLib.file_set_contents(
+                filePath,
+                JSON.stringify(spec, null, 2)
+            );
+
             journal(`Wrote spec cache to ${filePath}`);
         } catch (e) {
             journal(`Failed to write spec cache: ${e.message}`, true);
@@ -1413,11 +1851,16 @@ export default class SimpleDmenuExtension extends Extension {
 
     _removeSpecCache() {
         try {
-            const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, SPEC_CACHE_FILE]);
+            const filePath = GLib.build_filenamev([
+                SPEC_CACHE_DIR,
+                SPEC_CACHE_FILE,
+            ]);
+
             const file = Gio.File.new_for_path(filePath);
+
             if (file.query_exists(null)) {
                 file.delete(null);
-                journal(`Removed spec cache`);
+                journal('Removed spec cache');
             }
         } catch (e) {
             journal(`Failed to remove spec cache: ${e.message}`, true);
@@ -1425,9 +1868,20 @@ export default class SimpleDmenuExtension extends Extension {
     }
 
     _installCli() {
-        const cliScript = GLib.build_filenamev([this.path, 'cli', 'gdmenu']);
-        const binDir = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin']);
-        const symlinkPath = GLib.build_filenamev([binDir, 'gdmenu']);
+        const cliScript = GLib.build_filenamev([
+            this.path,
+            'cli',
+            'gdmenu',
+        ]);
+        const binDir = GLib.build_filenamev([
+            GLib.get_home_dir(),
+            '.local',
+            'bin',
+        ]);
+        const symlinkPath = GLib.build_filenamev([
+            binDir,
+            'gdmenu',
+        ]);
 
         try {
             GLib.chmod(cliScript, 0o755);
@@ -1441,6 +1895,7 @@ export default class SimpleDmenuExtension extends Extension {
                     Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
                     null
                 );
+
                 if (info.get_symlink_target() !== cliScript) {
                     linkFile.delete(null);
                     linkFile.make_symbolic_link(cliScript, null);
@@ -1456,20 +1911,31 @@ export default class SimpleDmenuExtension extends Extension {
     }
 
     _removeCliSymlink() {
-        const cliScript = GLib.build_filenamev([this.path, 'cli', 'gdmenu']);
-        const symlinkPath = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'gdmenu']);
+        const cliScript = GLib.build_filenamev([
+            this.path,
+            'cli',
+            'gdmenu',
+        ]);
+        const symlinkPath = GLib.build_filenamev([
+            GLib.get_home_dir(),
+            '.local',
+            'bin',
+            'gdmenu',
+        ]);
 
         try {
             const linkFile = Gio.File.new_for_path(symlinkPath);
+
             if (linkFile.query_exists(null)) {
                 const info = linkFile.query_info(
                     Gio.FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
                     Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
                     null
                 );
+
                 if (info.get_symlink_target() === cliScript) {
                     linkFile.delete(null);
-                    journal(`Removed CLI symlink`);
+                    journal('Removed CLI symlink');
                 }
             }
         } catch (e) {
@@ -1500,15 +1966,15 @@ export default class SimpleDmenuExtension extends Extension {
         this._service = new DmenuService(this);
         this._service.export();
 
-        this._ui = new DmenuUI(this._service);
+        this._controller = new DmenuController(this._service);
 
         this._installCli();
         this._writeSpecCache();
     }
 
     disable() {
-        this._ui?.hide();
-        this._ui = null;
+        this._controller?.destroy();
+        this._controller = null;
 
         this._service?.unexport();
         this._service = null;
@@ -1518,18 +1984,18 @@ export default class SimpleDmenuExtension extends Extension {
     }
 
     show(items, multi = false, hint = null, fullscreen = false) {
-        this._ui.show(items, multi, hint, fullscreen);
+        this._controller.show(items, multi, hint, fullscreen);
     }
 
     showApps(multi = false, hint = null, fullscreen = false) {
-        this._ui.showApps(multi, hint, fullscreen);
+        this._controller.showApps(multi, hint, fullscreen);
     }
 
     showWindows(multi = false, hint = null, fullscreen = false) {
-        this._ui.showWindows(multi, hint, fullscreen);
+        this._controller.showWindows(multi, hint, fullscreen);
     }
 
     showPaths(paths, multi = false, hint = null, fullscreen = false) {
-        this._ui.showPaths(paths, multi, hint, fullscreen);
+        this._controller.showPaths(paths, multi, hint, fullscreen);
     }
 }
