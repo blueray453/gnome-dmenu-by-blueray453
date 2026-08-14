@@ -2,6 +2,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
+import Pango from 'gi://Pango';
 import Shell from 'gi://Shell';
 import Meta from 'gi://Meta';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -292,10 +293,16 @@ const DmenuUI = class {
         this._openMenu = null;
 
         // Preview state
+
         this._previewClone = null;
+        this._previewOverlay = null;
+        this._previewTitle = null;
+        this._previewCloseButton = null;
+
         this._previewWindow = null;
         this._previewWindowId = 0;
         this._previewUnmanagedId = 0;
+
         this._showPreview = false;
         this._previewBoxWidth = 0;
         this._previewBoxHeight = 0;
@@ -883,10 +890,18 @@ const DmenuUI = class {
             this._previewWindow.disconnect(this._previewUnmanagedId);
             this._previewUnmanagedId = 0;
         }
-        if (this._previewClone) {
+
+        if (this._previewOverlay) {
+            this._previewOverlay.destroy();
+            this._previewOverlay = null;
+            this._previewClone = null;
+            this._previewTitle = null;
+            this._previewCloseButton = null;
+        } else if (this._previewClone) {
             this._previewClone.destroy();
             this._previewClone = null;
         }
+
         this._previewWindow = null;
         this._previewWindowId = 0;
         this._previewBox.remove_all_children();
@@ -899,12 +914,14 @@ const DmenuUI = class {
         }
 
         const item = this._visibleItems[this._selectedIndex];
+
         if (!item || !item.data) {
             this._clearPreview();
             return;
         }
 
         const window = item.data;
+
         if (!(window instanceof Meta.Window)) {
             this._clearPreview();
             return;
@@ -913,59 +930,235 @@ const DmenuUI = class {
         // If the window changed, clear old preview
         if (this._previewWindow !== window) {
             this._clearPreview();
+
             this._previewWindow = window;
             this._previewWindowId = window.get_id();
 
             this._previewUnmanagedId = window.connect('unmanaged', () => {
                 this._clearPreview();
-                this._previewBox.remove_all_children();
             });
         }
 
-        let actor = window.get_compositor_private();
+        const actor = window.get_compositor_private();
+
         if (!actor) {
             this._clearPreview();
             return;
         }
 
-        if (!this._previewClone) {
-            this._previewClone = new Clutter.Clone({
-                source: actor,
-                x_align: Clutter.ActorAlign.CENTER,
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-            this._previewBox.add_child(this._previewClone);
-        } else {
-            this._previewClone.source = actor;
-        }
-
+        // Get preview area dimensions BEFORE using them.
+        // This avoids:
+        // ReferenceError: can't access lexical declaration 'previewWidth'
         const previewWidth = this._previewBoxWidth;
         const previewHeight = this._previewBoxHeight;
+
         if (previewWidth <= 0 || previewHeight <= 0)
             return;
 
+        // ------------------------------------------------------------
+        // Create preview hierarchy
+        // ------------------------------------------------------------
+
+        if (!this._previewOverlay) {
+            // Overlay covers the entire preview box.
+            // Clone, title, and close button are positioned inside it.
+            this._previewOverlay = new Clutter.Actor({
+                width: previewWidth,
+                height: previewHeight,
+                reactive: true,
+            });
+
+            // Window clone
+            this._previewClone = new Clutter.Clone({
+                source: actor,
+            });
+
+            // --------------------------------------------------------
+            // Window title
+            // --------------------------------------------------------
+
+            this._previewTitle = new St.Label({
+                style_class: 'window-preview-title',
+                text: window.get_title() || 'Untitled',
+                x_align: Clutter.ActorAlign.FILL,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            // Center the actual text inside the label.
+            this._previewTitle.clutter_text.set_x_align(
+                Clutter.ActorAlign.CENTER
+            );
+
+            this._previewTitle.clutter_text.set_y_align(
+                Clutter.ActorAlign.CENTER
+            );
+
+            // Allow long titles to wrap to multiple lines.
+            this._previewTitle.clutter_text.set_line_wrap(true);
+
+            this._previewTitle.clutter_text.set_line_wrap_mode(
+                Pango.WrapMode.WORD_CHAR
+            );
+
+            // Do not ellipsize the title.
+            this._previewTitle.clutter_text.set_ellipsize(
+                Pango.EllipsizeMode.NONE
+            );
+
+            // Large + bold + readable.
+            this._previewTitle.set_style(
+                'font-size: 32px;' +
+                'font-weight: bold;' +
+                'color: white;' +
+                'background-color: rgba(0, 0, 0, 0.55);' +
+                'padding: 8px 16px;'
+            );
+
+            // --------------------------------------------------------
+            // Close button
+            // --------------------------------------------------------
+
+            this._previewCloseButton = new St.Button({
+                style_class: 'window-close-button',
+                child: new St.Icon({
+                    icon_name: 'window-close-symbolic',
+                    icon_size: 32,
+                }),
+                reactive: true,
+                can_focus: true,
+                track_hover: true,
+            });
+
+            this._previewCloseButton.connect('clicked', () => {
+                try {
+                    const currentWindow = this._previewWindow;
+
+                    if (currentWindow)
+                        currentWindow.delete(global.get_current_time());
+                } catch (e) {
+                    journal(
+                        `Failed to close preview window: ${e.message}`,
+                        true
+                    );
+                }
+
+                this._clearPreview();
+
+                return Clutter.EVENT_STOP;
+            });
+
+            // --------------------------------------------------------
+            // Build hierarchy
+            // --------------------------------------------------------
+
+            this._previewOverlay.add_child(this._previewClone);
+            this._previewOverlay.add_child(this._previewTitle);
+            this._previewOverlay.add_child(this._previewCloseButton);
+
+            this._previewBox.add_child(this._previewOverlay);
+        } else {
+            // Existing preview — update source and title.
+            this._previewClone.source = actor;
+
+            this._previewTitle.text = window.get_title() || 'Untitled';
+        }
+
+        // Keep overlay synced to current preview size.
+        this._previewOverlay.set_size(
+            previewWidth,
+            previewHeight
+        );
+
+        // ------------------------------------------------------------
+        // Determine source dimensions
+        // ------------------------------------------------------------
+
         let srcWidth = actor.width || 0;
         let srcHeight = actor.height || 0;
+
         if (srcWidth === 0 || srcHeight === 0) {
             const rect = window.get_frame_rect();
+
             srcWidth = rect.width;
             srcHeight = rect.height;
         }
+
         if (srcWidth === 0 || srcHeight === 0) {
             srcWidth = 100;
             srcHeight = 100;
         }
 
+        // ------------------------------------------------------------
+        // Scale window to fit preview area
+        // ------------------------------------------------------------
+
         const scaleX = previewWidth / srcWidth;
         const scaleY = previewHeight / srcHeight;
-        const scale = Math.min(scaleX, scaleY, 1.0);
+
+        const scale = Math.min(
+            scaleX,
+            scaleY,
+            1.0
+        );
+
         const targetWidth = srcWidth * scale;
         const targetHeight = srcHeight * scale;
 
-        this._previewClone.set_size(targetWidth, targetHeight);
+        // ------------------------------------------------------------
+        // Position clone
+        // ------------------------------------------------------------
+
+        const cloneX = (previewWidth - targetWidth) / 2;
+        const cloneY = (previewHeight - targetHeight) / 2;
+
+        this._previewClone.set_size(
+            targetWidth,
+            targetHeight
+        );
+
         this._previewClone.set_position(
-            (previewWidth - targetWidth) / 2,
-            (previewHeight - targetHeight) / 2
+            cloneX,
+            cloneY
+        );
+
+        // ------------------------------------------------------------
+        // Position title
+        // ------------------------------------------------------------
+
+        // Keep title centered over the actual cloned window,
+        // not the entire preview box.
+        //
+        // The title gets enough height for multiple wrapped lines.
+        const titleHeight = Math.min(
+            140,
+            Math.max(60, targetHeight * 0.25)
+        );
+
+        this._previewTitle.set_size(
+            targetWidth,
+            titleHeight
+        );
+
+        this._previewTitle.set_position(
+            cloneX,
+            cloneY + (targetHeight / 2) - (titleHeight / 2)
+        );
+
+        // ------------------------------------------------------------
+        // Position close button
+        // ------------------------------------------------------------
+
+        const closeButtonSize = 48;
+        const closeMargin = 10;
+
+        this._previewCloseButton.set_size(
+            closeButtonSize,
+            closeButtonSize
+        );
+
+        this._previewCloseButton.set_position(
+            cloneX + targetWidth - closeButtonSize - closeMargin,
+            cloneY + closeMargin
         );
     }
 
