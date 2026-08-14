@@ -843,6 +843,8 @@ const DmenuUI = class {
             showSingleWindows: true,
         });
 
+        menu.actor.add_style_class_name('dmenu-context-menu');
+
         Main.layoutManager.addChrome(menu.actor);
         menu.actor.hide();
         this._menuManager.addMenu(menu);
