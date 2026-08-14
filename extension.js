@@ -907,6 +907,34 @@ const DmenuUI = class {
         this._previewBox.remove_all_children();
     }
 
+    _removeClosedWindow(window) {
+        if (!window)
+            return;
+
+        const windowId = window.get_id();
+
+        // Remove the closed window from the master list.
+        this._allItems = this._allItems.filter(item => {
+            return item.data !== window && String(item.id) !== String(windowId);
+        });
+
+        // Recalculate fuzzy-search results using the updated master list.
+        this._updateResults();
+
+        // Keep selection valid.
+        if (this._visibleItems.length === 0) {
+            this._selectedIndex = 0;
+            this._clearPreview();
+            return;
+        }
+
+        if (this._selectedIndex >= this._visibleItems.length)
+            this._selectedIndex = this._visibleItems.length - 1;
+
+        // Render again with the corrected selection.
+        this._render();
+    }
+
     _updatePreview() {
         if (!this._showPreview || !this._isOpen || this._visibleItems.length === 0) {
             this._clearPreview();
@@ -935,7 +963,11 @@ const DmenuUI = class {
             this._previewWindowId = window.get_id();
 
             this._previewUnmanagedId = window.connect('unmanaged', () => {
+                journal(`[WindowPreview] Window closed: ${window.get_title()}`);
+
                 this._clearPreview();
+
+                this._removeClosedWindow(window);
             });
         }
 
@@ -1041,8 +1073,6 @@ const DmenuUI = class {
                         true
                     );
                 }
-
-                this._clearPreview();
 
                 return Clutter.EVENT_STOP;
             });
