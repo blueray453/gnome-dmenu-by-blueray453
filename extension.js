@@ -66,6 +66,64 @@ const DBUS_INTERFACE = `<node>
 </node>`;
 
 // ============================================================
+// LAYOUT CONSTANTS
+// Single source of truth for every dimension that layout/positioning
+// math elsewhere in this file also depends on. These are applied to
+// actors via set_style() at creation time instead of living in
+// stylesheet.css — so there is never a second copy of a number to
+// keep in sync. Change a value here and both the visuals and the
+// layout math move together automatically.
+//
+// Anything NOT listed here (colors, fonts, border-radius, hover
+// states, transitions) has no bearing on layout math and stays in
+// stylesheet.css as normal, freely-editable CSS.
+// ============================================================
+
+const LAYOUT = {
+    // .dmenu-container
+    CONTAINER_PADDING: 32,
+
+    // result row marker columns (dmenu-marker / dmenu-pin-marker)
+    MULTI_MARKER_WIDTH: 44,
+    PIN_MARKER_WIDTH: 40,
+
+    // result row icon
+    RESULT_ICON_SIZE: 48,
+
+    // pinned app bar icon
+    PINNED_ICON_SIZE: 48,
+
+    // .dmenu-preview-box
+    PREVIEW_BOX_MARGIN: 4,
+
+    // window clone close button
+    CLOSE_BUTTON_SIZE: 48,
+    CLOSE_BUTTON_MARGIN: 10,
+    CLOSE_BUTTON_ICON_SIZE: 32,
+
+    // window clone title overlay
+    TITLE_HEIGHT_MIN: 60,
+    TITLE_HEIGHT_MAX: 140,
+    TITLE_HEIGHT_FRACTION: 0.25,
+    TITLE_GAP: 12,
+
+    // centered (non-fullscreen) preview view sizing
+    CENTERED_WIDTH_FRAC: 0.9,
+    CENTERED_HEIGHT_FRAC: 0.8,
+    LEFT_RAIL_FRAC: 0.25,
+    LEFT_RAIL_MIN_WIDTH: 300,
+    PREVIEW_MIN_WIDTH: 400,
+    LEFT_RAIL_FALLBACK_WIDTH: 200,
+    RAIL_GAP: 10,
+
+    // non-preview (stdin/paths/drun) centered view sizing
+    STDIN_MAX_WIDTH: 1000,
+    STDIN_MAX_HEIGHT: 600,
+    STDIN_MARGIN: 100,
+    STDIN_VERTICAL_MARGIN: 150,
+};
+
+// ============================================================
 // HELPERS
 // ============================================================
 
@@ -408,9 +466,9 @@ function createClonePreviewActor(window, targetHeight, options = {}) {
     container.add_child(cloneContainer);
 
     if (options.onClose) {
-        const closeIconSize = options.closeButtonSize ?? 32;
+        const closeIconSize = options.closeButtonSize ?? LAYOUT.CLOSE_BUTTON_ICON_SIZE;
         const closeOffsetX = options.closeButtonOffsetX ?? (closeIconSize + 14);
-        const closeOffsetY = options.closeButtonOffsetY ?? 10;
+        const closeOffsetY = options.closeButtonOffsetY ?? LAYOUT.CLOSE_BUTTON_MARGIN;
 
         const closeButton = new St.Button({
             style_class: 'window-close-button',
@@ -423,6 +481,7 @@ function createClonePreviewActor(window, targetHeight, options = {}) {
             reactive: true,
         });
 
+        closeButton.set_size(LAYOUT.CLOSE_BUTTON_SIZE, LAYOUT.CLOSE_BUTTON_SIZE);
         closeButton.set_position(targetWidth - closeOffsetX, closeOffsetY);
         closeButton.connect('clicked', () => {
             options.onClose(window);
@@ -447,7 +506,9 @@ class WindowPreview {
         this._window = null;
         this._unmanagedId = 0;
 
-        this._clone = null; // clipped container returned by createClonePreviewActor
+        this._wrapper = null; // plain Clutter.Actor for absolute positioning
+        // inside the BoxLayout container
+        this._clone = null;
         this._title = null;
     }
 
@@ -471,8 +532,8 @@ class WindowPreview {
             return;
         }
 
-        // Fit-to-box: try full height first, fall back to fitting width —
-        // identical to WindowCollectionOverlay._updatePreview.
+        // Clone fits the full box again — no more room reserved for a
+        // separate title band above it.
         const aspect = windowFrame.width / windowFrame.height;
         let targetHeight = height;
         let targetWidth = targetHeight * aspect;
@@ -483,9 +544,9 @@ class WindowPreview {
 
         const built = createClonePreviewActor(window, targetHeight, {
             onClose: win => this._requestClose(win),
-            closeButtonSize: 48,
-            closeButtonOffsetX: 58,
-            closeButtonOffsetY: 10,
+            closeButtonSize: LAYOUT.CLOSE_BUTTON_ICON_SIZE,
+            closeButtonOffsetX: LAYOUT.CLOSE_BUTTON_ICON_SIZE + LAYOUT.CLOSE_BUTTON_MARGIN + 4,
+            closeButtonOffsetY: LAYOUT.CLOSE_BUTTON_MARGIN,
         });
 
         if (!built) {
@@ -493,15 +554,26 @@ class WindowPreview {
             return;
         }
 
+        this._wrapper = new Clutter.Actor({ width, height });
+        this._container.add_child(this._wrapper);
+
         const cloneX = Math.max(0, (width - built.width) / 2);
         const cloneY = Math.max(0, (height - built.height) / 2);
 
         built.actor.set_position(cloneX, cloneY);
-
         this._clone = built.actor;
-        this._container.add_child(this._clone);
+        this._wrapper.add_child(this._clone);
 
-        this._updateTitle(window, built.width, built.height, cloneX, cloneY);
+        // Title overlays the clone, centered within the clone's own
+        // bounds (not the full preview box) — matches the original
+        // "floating label over the middle of the window" look.
+        this._title = this._buildTitle(window, built.width, built.height);
+        const titleHeight = this._title.height; // set via set_size() in _buildTitle
+        this._title.set_position(
+            cloneX,
+            cloneY + (built.height - titleHeight) / 2
+        );
+        this._wrapper.add_child(this._title);
     }
 
     hide() {
@@ -516,19 +588,14 @@ class WindowPreview {
     }
 
     _clearClone() {
-        if (this._clone) {
-            if (this._clone.get_parent() === this._container)
-                this._container.remove_child(this._clone);
-            this._clone.destroy();
-            this._clone = null;
+        if (this._wrapper) {
+            if (this._wrapper.get_parent() === this._container)
+                this._container.remove_child(this._wrapper);
+            this._wrapper.destroy();
+            this._wrapper = null;
         }
-
-        if (this._title) {
-            if (this._title.get_parent() === this._container)
-                this._container.remove_child(this._title);
-            this._title.destroy();
-            this._title = null;
-        }
+        this._clone = null;
+        this._title = null;
     }
 
     _connectWindowLifecycle(window) {
@@ -566,28 +633,29 @@ class WindowPreview {
         }
     }
 
-    _updateTitle(window, targetWidth, targetHeight, cloneX, cloneY) {
+    _buildTitle(window, cloneWidth, cloneHeight) {
         const titleText = window.get_title();
 
-        this._title = new St.Label({
+        const title = new St.Label({
             style_class: 'window-preview-title',
             x_align: Clutter.ActorAlign.FILL,
             y_align: Clutter.ActorAlign.CENTER,
             text: titleText && titleText.trim() ? titleText : 'Untitled',
         });
 
-        this._title.clutter_text.set_x_align(Clutter.ActorAlign.CENTER);
-        this._title.clutter_text.set_y_align(Clutter.ActorAlign.CENTER);
-        this._title.clutter_text.set_line_wrap(true);
-        this._title.clutter_text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR);
-        this._title.clutter_text.set_ellipsize(Pango.EllipsizeMode.NONE);
+        title.clutter_text.set_x_align(Clutter.ActorAlign.CENTER);
+        title.clutter_text.set_y_align(Clutter.ActorAlign.CENTER);
+        title.clutter_text.set_line_wrap(true);
+        title.clutter_text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR);
+        title.clutter_text.set_ellipsize(Pango.EllipsizeMode.NONE);
 
-        const titleHeight = Math.min(140, Math.max(60, targetHeight * 0.25));
+        const titleHeight = Math.min(
+            LAYOUT.TITLE_HEIGHT_MAX,
+            Math.max(LAYOUT.TITLE_HEIGHT_MIN, cloneHeight * LAYOUT.TITLE_HEIGHT_FRACTION)
+        );
+        title.set_size(cloneWidth, titleHeight);
 
-        this._title.set_size(targetWidth, titleHeight);
-        this._title.set_position(cloneX, cloneY + (targetHeight - titleHeight) / 2);
-
-        this._container.add_child(this._title);
+        return title;
     }
 }
 
@@ -895,6 +963,8 @@ class DmenuView {
             can_focus: true,
         });
 
+        this.actor.set_style(`padding: ${LAYOUT.CONTAINER_PADDING}px;`);
+
         this.leftBox = new St.BoxLayout({
             style_class: 'dmenu-left-box',
             vertical: true,
@@ -909,6 +979,8 @@ class DmenuView {
             y_expand: true,
             visible: false,
         });
+
+        this.previewBox.set_style(`margin: ${LAYOUT.PREVIEW_BOX_MARGIN}px;`);
 
         this.actor.add_child(this.leftBox);
         this.actor.add_child(this.previewBox);
@@ -1021,27 +1093,27 @@ class DmenuView {
 
     configureLayout(showPreview, fullscreen) {
         const monitor = Main.layoutManager.primaryMonitor;
-        const CONTAINER_PADDING = 32; // must match .dmenu-container padding in stylesheet.css
+        const pad2 = LAYOUT.CONTAINER_PADDING * 2;
 
-        let totalWidth;
-        let totalHeight;
-        let leftWidth;
-        let previewWidth = 0;
+        let totalWidth, totalHeight, leftWidth, previewWidth = 0;
+
+        const computeRail = usableWidth => {
+            let lw = Math.max(LAYOUT.LEFT_RAIL_MIN_WIDTH, Math.floor(usableWidth * LAYOUT.LEFT_RAIL_FRAC));
+            let pw = usableWidth - lw - LAYOUT.RAIL_GAP;
+
+            if (pw < LAYOUT.PREVIEW_MIN_WIDTH) {
+                lw = Math.max(LAYOUT.LEFT_RAIL_FALLBACK_WIDTH, usableWidth - LAYOUT.PREVIEW_MIN_WIDTH - LAYOUT.RAIL_GAP);
+                pw = usableWidth - lw - LAYOUT.RAIL_GAP;
+            }
+            return [lw, pw];
+        };
 
         if (showPreview) {
             if (fullscreen) {
                 totalWidth = monitor.width;
                 totalHeight = monitor.height;
 
-                const usableWidth = totalWidth - CONTAINER_PADDING * 2;
-
-                leftWidth = Math.max(300, Math.floor(usableWidth * 0.25));
-                previewWidth = usableWidth - leftWidth - 10;
-
-                if (previewWidth < 400) {
-                    leftWidth = Math.max(200, usableWidth - 400 - 10);
-                    previewWidth = usableWidth - leftWidth - 10;
-                }
+                [leftWidth, previewWidth] = computeRail(totalWidth - pad2);
 
                 this.leftBox.set_width(leftWidth);
                 this.previewBox.visible = true;
@@ -1053,27 +1125,16 @@ class DmenuView {
                 return { previewWidth, previewHeight: totalHeight };
             }
 
-            // Original centered view — unchanged, never hit this bug since
-            // leftWidth here is a fraction of totalWidth, not the full width.
-            const WIDTH_FRAC = 0.9;
-            const HEIGHT_FRAC = 0.8;
-
             totalWidth = Math.min(
-                Math.floor(monitor.width * WIDTH_FRAC),
+                Math.floor(monitor.width * LAYOUT.CENTERED_WIDTH_FRAC),
                 monitor.width - 40
             );
             totalHeight = Math.min(
-                Math.floor(monitor.height * HEIGHT_FRAC),
+                Math.floor(monitor.height * LAYOUT.CENTERED_HEIGHT_FRAC),
                 monitor.height - 40
             );
 
-            leftWidth = Math.max(300, Math.floor(totalWidth * 0.25));
-            previewWidth = totalWidth - leftWidth - 10;
-
-            if (previewWidth < 400) {
-                leftWidth = Math.max(200, totalWidth - 400 - 10);
-                previewWidth = totalWidth - leftWidth - 10;
-            }
+            [leftWidth, previewWidth] = computeRail(totalWidth);
 
             this.leftBox.set_width(leftWidth);
             this.previewBox.visible = true;
@@ -1088,13 +1149,9 @@ class DmenuView {
             return { previewWidth, previewHeight: totalHeight };
         }
 
-        // Non-preview modes: stdin/paths/drun, fullscreen or centered.
-        const MAX_WIDTH = Math.min(1000, monitor.width - 100);
-        const MAX_HEIGHT = Math.min(600, monitor.height - 150);
-
-        totalWidth = MAX_WIDTH;
-        totalHeight = MAX_HEIGHT;
-        leftWidth = totalWidth - CONTAINER_PADDING * 2;   // <-- fixed
+        totalWidth = Math.min(LAYOUT.STDIN_MAX_WIDTH, monitor.width - LAYOUT.STDIN_MARGIN);
+        totalHeight = Math.min(LAYOUT.STDIN_MAX_HEIGHT, monitor.height - LAYOUT.STDIN_VERTICAL_MARGIN);
+        leftWidth = totalWidth - pad2;
 
         this.leftBox.set_width(leftWidth);
         this.previewBox.visible = false;
@@ -1103,7 +1160,7 @@ class DmenuView {
             this.actor.set_width(monitor.width);
             this.actor.set_height(monitor.height);
             this.actor.set_position(monitor.x, monitor.y);
-            this.leftBox.set_width(monitor.width - CONTAINER_PADDING * 2); // <-- fixed
+            this.leftBox.set_width(monitor.width - pad2);
         } else {
             this.actor.set_width(totalWidth);
             this.actor.set_height(totalHeight);
@@ -1137,6 +1194,7 @@ class DmenuView {
                     style_class: 'dmenu-marker',
                     y_align: Clutter.ActorAlign.CENTER,
                 });
+                marker.set_style(`width: ${LAYOUT.MULTI_MARKER_WIDTH}px; text-align: center;`);
                 row.add_child(marker);
             }
 
@@ -1146,6 +1204,7 @@ class DmenuView {
                     style_class: 'dmenu-pin-marker',
                     y_align: Clutter.ActorAlign.CENTER,
                 });
+                pinMarker.set_style(`width: ${LAYOUT.PIN_MARKER_WIDTH}px; text-align: center;`);
                 row.add_child(pinMarker);
             }
 
@@ -1154,6 +1213,7 @@ class DmenuView {
                 iconActor = new St.Icon({
                     gicon: item.icon,
                     style_class: 'dmenu-icon',
+                    icon_size: LAYOUT.RESULT_ICON_SIZE,
                     y_align: Clutter.ActorAlign.CENTER,
                 });
             }
@@ -1234,7 +1294,7 @@ class DmenuView {
                 style_class: 'dmenu-pinned-icon',
                 child: new St.Icon({
                     gicon: app.get_icon(),
-                    icon_size: 48,
+                    icon_size: LAYOUT.PINNED_ICON_SIZE,
                 }),
                 reactive: true,
                 can_focus: true,

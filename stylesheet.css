@@ -22,8 +22,8 @@
     background-color: rgba(0, 43, 54, 0.97);
     border: 1px solid #073642;
     border-radius: 20px;
-    padding: 32px;
     spacing: 18px;
+    /* padding now set by LAYOUT.CONTAINER_PADDING in extension.js */
 }
 
 .dmenu-entry {
@@ -45,13 +45,12 @@
 .dmenu-marker {
     font-size: 40px;
     color: #2aa198;
-    width: 44px;
-    text-align: center;
+    /* width now set by LAYOUT.MULTI_MARKER_WIDTH in extension.js */
 }
 
 .dmenu-icon {
-    icon-size: 48px;
     padding: 0 14px 0 0;
+    /* icon-size now set by LAYOUT.RESULT_ICON_SIZE in extension.js */
 }
 
 .dmenu-result {
@@ -92,8 +91,7 @@
 .dmenu-pin-marker {
     font-size: 28px;
     color: #b58900;
-    width: 40px;
-    text-align: center;
+    /* width now set by LAYOUT.PIN_MARKER_WIDTH in extension.js */
 }
 
 .dmenu-context-menu {
@@ -141,10 +139,10 @@
 }
 
 .dmenu-preview-box {
-    background-color: #002b36; /* Solarized base03 */
-    border: 1px solid #586e75; /* Solarized base01 */
+    background-color: #002b36;
+    border: 1px solid #586e75;
     border-radius: 8px;
-    margin: 4px;
+    /* margin now set by LAYOUT.PREVIEW_BOX_MARGIN in extension.js */
 }
 
 .dmenu-left-box {
@@ -164,12 +162,44 @@
     border-radius: 6px;
 }
 
+.dmenu-container {
+    background-color: rgba(0, 43, 54, 0.97);
+    border: 1px solid #073642;
+    border-radius: 20px;
+    spacing: 18px;
+    /* padding now set by LAYOUT.CONTAINER_PADDING in extension.js */
+}
+
+.dmenu-marker {
+    font-size: 40px;
+    color: #2aa198;
+    /* width now set by LAYOUT.MULTI_MARKER_WIDTH in extension.js */
+}
+
+.dmenu-icon {
+    padding: 0 14px 0 0;
+    /* icon-size now set by LAYOUT.RESULT_ICON_SIZE in extension.js */
+}
+
+.dmenu-pin-marker {
+    font-size: 28px;
+    color: #b58900;
+    /* width now set by LAYOUT.PIN_MARKER_WIDTH in extension.js */
+}
+
+.dmenu-preview-box {
+    background-color: #002b36;
+    border: 1px solid #586e75;
+    border-radius: 8px;
+    /* margin now set by LAYOUT.PREVIEW_BOX_MARGIN in extension.js */
+}
+
 .window-close-button {
-    background-color: rgba(0, 43, 54, 0.75); /* Solarized base03 */
-    border: 1px solid #586e75; /* Solarized base01 */
+    background-color: rgba(0, 43, 54, 0.75);
+    border: 1px solid #586e75;
     border-radius: 24px;
-    color: #eee8d5; /* Solarized base2 */
-    icon-size: 32px;
+    color: #eee8d5;
+    /* icon-size now set by LAYOUT.CLOSE_BUTTON_ICON_SIZE in extension.js */
 }
 
 .window-close-button:hover {
