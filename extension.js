@@ -362,6 +362,80 @@ class AppMenuController {
 }
 
 // ============================================================
+// SHARED CLONE-PREVIEW BUILDER
+// Same technique used by the workspace-thumbnails extension: corrects
+// for mutter's invisible shadow margin (buffer_rect vs frame_rect) so
+// the clipped clone shows only the visible window content, scaled and
+// centered exactly to targetHeight.
+// ============================================================
+
+function createClonePreviewActor(window, targetHeight, options = {}) {
+    if (!window)
+        return null;
+
+    const windowActor = window.get_compositor_private();
+    if (!windowActor)
+        return null;
+
+    const windowFrame = window.get_frame_rect();
+    const bufferFrame = window.get_buffer_rect();
+    if (windowFrame.height === 0)
+        return null;
+
+    const targetWidth = targetHeight * (windowFrame.width / windowFrame.height);
+    const scale = targetHeight / windowFrame.height;
+
+    const scaledLeftShadow = (windowFrame.x - bufferFrame.x) * scale;
+    const scaledTopShadow = (windowFrame.y - bufferFrame.y) * scale;
+    const scaledRightShadow = ((bufferFrame.x + bufferFrame.width) - (windowFrame.x + windowFrame.width)) * scale;
+    const scaledBottomShadow = ((bufferFrame.y + bufferFrame.height) - (windowFrame.y + windowFrame.height)) * scale;
+
+    const container = new Clutter.Actor({
+        width: targetWidth,
+        height: targetHeight,
+        clip_to_allocation: true,
+    });
+
+    const clone = new Clutter.Clone({
+        source: windowActor,
+        width: targetWidth + scaledLeftShadow + scaledRightShadow,
+        height: targetHeight + scaledTopShadow + scaledBottomShadow,
+    });
+    clone.set_position(-scaledLeftShadow, -scaledTopShadow);
+
+    const cloneContainer = new Clutter.Actor();
+    cloneContainer.add_child(clone);
+    container.add_child(cloneContainer);
+
+    if (options.onClose) {
+        const closeIconSize = options.closeButtonSize ?? 32;
+        const closeOffsetX = options.closeButtonOffsetX ?? (closeIconSize + 14);
+        const closeOffsetY = options.closeButtonOffsetY ?? 10;
+
+        const closeButton = new St.Button({
+            style_class: 'window-close-button',
+            child: new St.Icon({
+                icon_name: 'window-close-symbolic',
+                icon_size: closeIconSize,
+            }),
+            x_align: Clutter.ActorAlign.END,
+            y_align: Clutter.ActorAlign.START,
+            reactive: true,
+        });
+
+        closeButton.set_position(targetWidth - closeOffsetX, closeOffsetY);
+        closeButton.connect('clicked', () => {
+            options.onClose(window);
+            return Clutter.EVENT_STOP;
+        });
+
+        cloneContainer.add_child(closeButton);
+    }
+
+    return { actor: container, width: targetWidth, height: targetHeight };
+}
+
+// ============================================================
 // WINDOW PREVIEW / CLONE
 // ============================================================
 
@@ -373,74 +447,88 @@ class WindowPreview {
         this._window = null;
         this._unmanagedId = 0;
 
-        this._overlay = null;
-        this._clone = null;
+        this._clone = null; // clipped container returned by createClonePreviewActor
         this._title = null;
-        this._closeButton = null;
     }
 
     show(window, width, height) {
-        if (!(window instanceof Meta.Window)) {
-            this.hide();
-            return;
-        }
-
-        if (width <= 0 || height <= 0) {
+        if (!(window instanceof Meta.Window) || width <= 0 || height <= 0) {
             this.hide();
             return;
         }
 
         if (this._window !== window) {
-            this.hide();
+            this._disconnectWindowLifecycle();
             this._window = window;
             this._connectWindowLifecycle(window);
         }
 
-        const actor = window.get_compositor_private();
-        if (!actor) {
+        this._clearClone();
+
+        const windowFrame = window.get_frame_rect();
+        if (windowFrame.height === 0) {
             this.hide();
             return;
         }
 
-        this._ensureActors(actor);
+        // Fit-to-box: try full height first, fall back to fitting width —
+        // identical to WindowCollectionOverlay._updatePreview.
+        const aspect = windowFrame.width / windowFrame.height;
+        let targetHeight = height;
+        let targetWidth = targetHeight * aspect;
+        if (targetWidth > width) {
+            targetWidth = width;
+            targetHeight = targetWidth / aspect;
+        }
 
-        this._overlay.set_size(width, height);
-        this._clone.source = actor;
+        const built = createClonePreviewActor(window, targetHeight, {
+            onClose: win => this._requestClose(win),
+            closeButtonSize: 48,
+            closeButtonOffsetX: 58,
+            closeButtonOffsetY: 10,
+        });
 
-        const [targetWidth, targetHeight] = this._calculateTargetSize(
-            window,
-            actor,
-            width,
-            height
-        );
+        if (!built) {
+            this.hide();
+            return;
+        }
 
-        const cloneX = (width - targetWidth) / 2;
-        const cloneY = (height - targetHeight) / 2;
+        const cloneX = Math.max(0, (width - built.width) / 2);
+        const cloneY = Math.max(0, (height - built.height) / 2);
 
-        this._clone.set_size(targetWidth, targetHeight);
-        this._clone.set_position(cloneX, cloneY);
+        built.actor.set_position(cloneX, cloneY);
 
-        this._updateTitle(window, targetWidth, targetHeight, cloneX, cloneY);
-        this._updateCloseButton(targetWidth, cloneX, cloneY);
+        this._clone = built.actor;
+        this._container.add_child(this._clone);
+
+        this._updateTitle(window, built.width, built.height, cloneX, cloneY);
     }
 
     hide() {
         this._disconnectWindowLifecycle();
         this._window = null;
-
-        if (this._overlay)
-            this._overlay.destroy();
-
-        this._overlay = null;
-        this._clone = null;
-        this._title = null;
-        this._closeButton = null;
-
+        this._clearClone();
         this._container.remove_all_children();
     }
 
     destroy() {
         this.hide();
+    }
+
+    _clearClone() {
+        if (this._clone) {
+            if (this._clone.get_parent() === this._container)
+                this._container.remove_child(this._clone);
+            this._clone.destroy();
+            this._clone = null;
+        }
+
+        if (this._title) {
+            if (this._title.get_parent() === this._container)
+                this._container.remove_child(this._title);
+            this._title.destroy();
+            this._title = null;
+        }
     }
 
     _connectWindowLifecycle(window) {
@@ -449,14 +537,7 @@ class WindowPreview {
 
             const closedWindow = this._window;
             this._window = null;
-
-            if (this._overlay)
-                this._overlay.destroy();
-
-            this._overlay = null;
-            this._clone = null;
-            this._title = null;
-            this._closeButton = null;
+            this._clearClone();
             this._container.remove_all_children();
 
             if (this._onWindowClosed)
@@ -477,22 +558,22 @@ class WindowPreview {
         this._unmanagedId = 0;
     }
 
-    _ensureActors(actor) {
-        if (this._overlay)
-            return;
+    _requestClose(window) {
+        try {
+            window.delete(global.get_current_time());
+        } catch (e) {
+            journal(`Failed to close preview window: ${e.message}`, true);
+        }
+    }
 
-        this._overlay = new Clutter.Actor({
-            reactive: true,
-        });
-
-        this._clone = new Clutter.Clone({
-            source: actor,
-        });
+    _updateTitle(window, targetWidth, targetHeight, cloneX, cloneY) {
+        const titleText = window.get_title();
 
         this._title = new St.Label({
             style_class: 'window-preview-title',
             x_align: Clutter.ActorAlign.FILL,
             y_align: Clutter.ActorAlign.CENTER,
+            text: titleText && titleText.trim() ? titleText : 'Untitled',
         });
 
         this._title.clutter_text.set_x_align(Clutter.ActorAlign.CENTER);
@@ -501,98 +582,12 @@ class WindowPreview {
         this._title.clutter_text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR);
         this._title.clutter_text.set_ellipsize(Pango.EllipsizeMode.NONE);
 
-        this._closeButton = new St.Button({
-            style_class: 'window-close-button',
-            child: new St.Icon({
-                icon_name: 'window-close-symbolic',
-                icon_size: 32,
-            }),
-            reactive: true,
-            can_focus: true,
-            track_hover: true,
-        });
-
-        this._closeButton.connect('clicked', () => {
-            this._requestClose();
-            return Clutter.EVENT_STOP;
-        });
-
-        this._overlay.add_child(this._clone);
-        this._overlay.add_child(this._title);
-        this._overlay.add_child(this._closeButton);
-        this._container.add_child(this._overlay);
-    }
-
-    _requestClose() {
-        const window = this._window;
-        if (!window)
-            return;
-
-        try {
-            window.delete(global.get_current_time());
-        } catch (e) {
-            journal(`Failed to close preview window: ${e.message}`, true);
-        }
-    }
-
-    _calculateTargetSize(window, actor, previewWidth, previewHeight) {
-        let srcWidth = actor.width || 0;
-        let srcHeight = actor.height || 0;
-
-        if (srcWidth === 0 || srcHeight === 0) {
-            const rect = window.get_frame_rect();
-            srcWidth = rect.width;
-            srcHeight = rect.height;
-        }
-
-        if (srcWidth === 0 || srcHeight === 0) {
-            srcWidth = 100;
-            srcHeight = 100;
-        }
-
-        const scaleX = previewWidth / srcWidth;
-        const scaleY = previewHeight / srcHeight;
-        const scale = Math.min(scaleX, scaleY, 1.0);
-
-        return [
-            srcWidth * scale,
-            srcHeight * scale,
-        ];
-    }
-
-    _updateTitle(window, targetWidth, targetHeight, cloneX, cloneY) {
-        if (!this._title)
-            return;
-
-        const titleText = window.get_title();
-        this._title.text = titleText && titleText.trim()
-            ? titleText
-            : 'Untitled';
-
-        const titleHeight = Math.min(
-            140,
-            Math.max(60, targetHeight * 0.25)
-        );
+        const titleHeight = Math.min(140, Math.max(60, targetHeight * 0.25));
 
         this._title.set_size(targetWidth, titleHeight);
-        this._title.set_position(
-            cloneX,
-            cloneY + (targetHeight - titleHeight) / 2
-        );
-    }
+        this._title.set_position(cloneX, cloneY + (targetHeight - titleHeight) / 2);
 
-    _updateCloseButton(targetWidth, cloneX, cloneY) {
-        if (!this._closeButton)
-            return;
-
-        const size = 48;
-        const margin = 10;
-
-        this._closeButton.set_size(size, size);
-        this._closeButton.set_position(
-            cloneX + targetWidth - size - margin,
-            cloneY + margin
-        );
+        this._container.add_child(this._title);
     }
 }
 
@@ -609,7 +604,7 @@ class WindowMode {
         return {
             multi: false,
             hint: true,
-            fullscreen: false,
+            fullscreen: true,
             preview: true,
         };
     }
@@ -1033,6 +1028,31 @@ class DmenuView {
         let previewWidth = 0;
 
         if (showPreview) {
+            if (fullscreen) {
+                // Same left-rail/preview split as the normal view below,
+                // just claiming the whole monitor instead of 90%/80% + centering.
+                totalWidth = monitor.width;
+                totalHeight = monitor.height;
+
+                leftWidth = Math.max(300, Math.floor(totalWidth * 0.25));
+                previewWidth = totalWidth - leftWidth - 10;
+
+                if (previewWidth < 400) {
+                    leftWidth = Math.max(200, totalWidth - 400 - 10);
+                    previewWidth = totalWidth - leftWidth - 10;
+                }
+
+                this.leftBox.set_width(leftWidth);
+                this.previewBox.visible = true;
+
+                this.actor.set_width(totalWidth);
+                this.actor.set_height(totalHeight);
+                this.actor.set_position(monitor.x, monitor.y);
+
+                return { previewWidth, previewHeight: totalHeight };
+            }
+
+            // Unchanged: the original centered view.
             const WIDTH_FRAC = 0.9;
             const HEIGHT_FRAC = 0.8;
 
@@ -1056,43 +1076,43 @@ class DmenuView {
 
             this.leftBox.set_width(leftWidth);
             this.previewBox.visible = true;
-        } else {
-            const MAX_WIDTH = Math.min(1000, monitor.width - 100);
-            const MAX_HEIGHT = Math.min(600, monitor.height - 150);
 
-            totalWidth = MAX_WIDTH;
-            totalHeight = MAX_HEIGHT;
-            leftWidth = totalWidth;
+            this.actor.set_width(totalWidth);
+            this.actor.set_height(totalHeight);
+            this.actor.set_position(
+                monitor.x + Math.floor((monitor.width - totalWidth) / 2),
+                monitor.y + Math.floor((monitor.height - totalHeight) / 2)
+            );
 
-            this.leftBox.set_width(leftWidth);
-            this.previewBox.visible = false;
+            return { previewWidth, previewHeight: totalHeight };
         }
 
-        this.actor.set_width(totalWidth);
-        this.actor.set_height(totalHeight);
+        // Non-preview modes: unchanged.
+        const MAX_WIDTH = Math.min(1000, monitor.width - 100);
+        const MAX_HEIGHT = Math.min(600, monitor.height - 150);
+
+        totalWidth = MAX_WIDTH;
+        totalHeight = MAX_HEIGHT;
+        leftWidth = totalWidth;
+
+        this.leftBox.set_width(leftWidth);
+        this.previewBox.visible = false;
 
         if (fullscreen) {
             this.actor.set_width(monitor.width);
             this.actor.set_height(monitor.height);
             this.actor.set_position(monitor.x, monitor.y);
             this.leftBox.set_width(monitor.width);
-            this.previewBox.visible = false;
-        } else if (showPreview) {
-            this.actor.set_position(
-                monitor.x + Math.floor((monitor.width - totalWidth) / 2),
-                monitor.y + Math.floor((monitor.height - totalHeight) / 2)
-            );
         } else {
+            this.actor.set_width(totalWidth);
+            this.actor.set_height(totalHeight);
             this.actor.set_position(
                 monitor.x + Math.floor((monitor.width - totalWidth) / 2),
                 monitor.y + Math.floor(monitor.height / 6)
             );
         }
 
-        return {
-            previewWidth,
-            previewHeight: totalHeight,
-        };
+        return { previewWidth, previewHeight: totalHeight };
     }
 
     renderResults(items, tokens, selectedIndex, selectedIds, modeName, multi) {
@@ -1630,9 +1650,10 @@ class DmenuController {
         this._search.setItems(items);
         this._selection.reset();
 
-        this._showPreview = Boolean(
-            capabilities.preview && !effectiveOptions.fullscreen
-        );
+        // this._showPreview = Boolean(
+        //     capabilities.preview && !effectiveOptions.fullscreen
+        // );
+        this._showPreview = Boolean(capabilities.preview);
 
         this._view.cancelPendingWork();
         this._view.resetInput();
