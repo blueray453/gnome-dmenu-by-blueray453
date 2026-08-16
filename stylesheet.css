@@ -17,7 +17,6 @@
    green   #859900
 */
 
-/* Solarized Dark palette */
 .dmenu-container {
     background-color: rgba(0, 43, 54, 0.97);
     border: 1px solid #073642;
@@ -160,38 +159,7 @@
     background-color: rgba(0, 0, 0, 0.55);
     padding: 8px 16px;
     border-radius: 6px;
-}
-
-.dmenu-container {
-    background-color: rgba(0, 43, 54, 0.97);
-    border: 1px solid #073642;
-    border-radius: 20px;
-    spacing: 18px;
-    /* padding now set by LAYOUT.CONTAINER_PADDING in extension.js */
-}
-
-.dmenu-marker {
-    font-size: 40px;
-    color: #2aa198;
-    /* width now set by LAYOUT.MULTI_MARKER_WIDTH in extension.js */
-}
-
-.dmenu-icon {
-    padding: 0 14px 0 0;
-    /* icon-size now set by LAYOUT.RESULT_ICON_SIZE in extension.js */
-}
-
-.dmenu-pin-marker {
-    font-size: 28px;
-    color: #b58900;
-    /* width now set by LAYOUT.PIN_MARKER_WIDTH in extension.js */
-}
-
-.dmenu-preview-box {
-    background-color: #002b36;
-    border: 1px solid #586e75;
-    border-radius: 8px;
-    /* margin now set by LAYOUT.PREVIEW_BOX_MARGIN in extension.js */
+    /* size/position now set by LAYOUT.TITLE_* in extension.js */
 }
 
 .window-close-button {

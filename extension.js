@@ -105,7 +105,6 @@ const LAYOUT = {
     TITLE_HEIGHT_MIN: 60,
     TITLE_HEIGHT_MAX: 140,
     TITLE_HEIGHT_FRACTION: 0.25,
-    TITLE_GAP: 12,
 
     // centered (non-fullscreen) preview view sizing
     CENTERED_WIDTH_FRAC: 0.9,
@@ -467,8 +466,10 @@ function createClonePreviewActor(window, targetHeight, options = {}) {
 
     if (options.onClose) {
         const closeIconSize = options.closeButtonSize ?? LAYOUT.CLOSE_BUTTON_ICON_SIZE;
-        const closeOffsetX = options.closeButtonOffsetX ?? (closeIconSize + 14);
+        const closeButtonSize = LAYOUT.CLOSE_BUTTON_SIZE;
+        const closeOffsetX = options.closeButtonOffsetX ?? (closeButtonSize + LAYOUT.CLOSE_BUTTON_MARGIN);
         const closeOffsetY = options.closeButtonOffsetY ?? LAYOUT.CLOSE_BUTTON_MARGIN;
+
 
         const closeButton = new St.Button({
             style_class: 'window-close-button',
@@ -545,7 +546,7 @@ class WindowPreview {
         const built = createClonePreviewActor(window, targetHeight, {
             onClose: win => this._requestClose(win),
             closeButtonSize: LAYOUT.CLOSE_BUTTON_ICON_SIZE,
-            closeButtonOffsetX: LAYOUT.CLOSE_BUTTON_ICON_SIZE + LAYOUT.CLOSE_BUTTON_MARGIN + 4,
+            closeButtonOffsetX: LAYOUT.CLOSE_BUTTON_SIZE + LAYOUT.CLOSE_BUTTON_MARGIN,
             closeButtonOffsetY: LAYOUT.CLOSE_BUTTON_MARGIN,
         });
 
@@ -1714,9 +1715,6 @@ class DmenuController {
         this._search.setItems(items);
         this._selection.reset();
 
-        // this._showPreview = Boolean(
-        //     capabilities.preview && !effectiveOptions.fullscreen
-        // );
         this._showPreview = Boolean(capabilities.preview);
 
         this._view.cancelPendingWork();
