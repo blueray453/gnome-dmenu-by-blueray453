@@ -1021,6 +1021,7 @@ class DmenuView {
 
     configureLayout(showPreview, fullscreen) {
         const monitor = Main.layoutManager.primaryMonitor;
+        const CONTAINER_PADDING = 32; // must match .dmenu-container padding in stylesheet.css
 
         let totalWidth;
         let totalHeight;
@@ -1029,17 +1030,17 @@ class DmenuView {
 
         if (showPreview) {
             if (fullscreen) {
-                // Same left-rail/preview split as the normal view below,
-                // just claiming the whole monitor instead of 90%/80% + centering.
                 totalWidth = monitor.width;
                 totalHeight = monitor.height;
 
-                leftWidth = Math.max(300, Math.floor(totalWidth * 0.25));
-                previewWidth = totalWidth - leftWidth - 10;
+                const usableWidth = totalWidth - CONTAINER_PADDING * 2;
+
+                leftWidth = Math.max(300, Math.floor(usableWidth * 0.25));
+                previewWidth = usableWidth - leftWidth - 10;
 
                 if (previewWidth < 400) {
-                    leftWidth = Math.max(200, totalWidth - 400 - 10);
-                    previewWidth = totalWidth - leftWidth - 10;
+                    leftWidth = Math.max(200, usableWidth - 400 - 10);
+                    previewWidth = usableWidth - leftWidth - 10;
                 }
 
                 this.leftBox.set_width(leftWidth);
@@ -1052,7 +1053,8 @@ class DmenuView {
                 return { previewWidth, previewHeight: totalHeight };
             }
 
-            // Unchanged: the original centered view.
+            // Original centered view — unchanged, never hit this bug since
+            // leftWidth here is a fraction of totalWidth, not the full width.
             const WIDTH_FRAC = 0.9;
             const HEIGHT_FRAC = 0.8;
 
@@ -1060,7 +1062,6 @@ class DmenuView {
                 Math.floor(monitor.width * WIDTH_FRAC),
                 monitor.width - 40
             );
-
             totalHeight = Math.min(
                 Math.floor(monitor.height * HEIGHT_FRAC),
                 monitor.height - 40
@@ -1087,13 +1088,13 @@ class DmenuView {
             return { previewWidth, previewHeight: totalHeight };
         }
 
-        // Non-preview modes: unchanged.
+        // Non-preview modes: stdin/paths/drun, fullscreen or centered.
         const MAX_WIDTH = Math.min(1000, monitor.width - 100);
         const MAX_HEIGHT = Math.min(600, monitor.height - 150);
 
         totalWidth = MAX_WIDTH;
         totalHeight = MAX_HEIGHT;
-        leftWidth = totalWidth;
+        leftWidth = totalWidth - CONTAINER_PADDING * 2;   // <-- fixed
 
         this.leftBox.set_width(leftWidth);
         this.previewBox.visible = false;
@@ -1102,7 +1103,7 @@ class DmenuView {
             this.actor.set_width(monitor.width);
             this.actor.set_height(monitor.height);
             this.actor.set_position(monitor.x, monitor.y);
-            this.leftBox.set_width(monitor.width);
+            this.leftBox.set_width(monitor.width - CONTAINER_PADDING * 2); // <-- fixed
         } else {
             this.actor.set_width(totalWidth);
             this.actor.set_height(totalHeight);
@@ -1130,17 +1131,23 @@ class DmenuView {
                 track_hover: true,
             });
 
-            const marker = new St.Label({
-                text: multi && selectedIds.has(item.id) ? '●' : '',
-                style_class: 'dmenu-marker',
-                y_align: Clutter.ActorAlign.CENTER,
-            });
+            if (multi) {
+                const marker = new St.Label({
+                    text: selectedIds.has(item.id) ? '●' : '',
+                    style_class: 'dmenu-marker',
+                    y_align: Clutter.ActorAlign.CENTER,
+                });
+                row.add_child(marker);
+            }
 
-            const pinMarker = new St.Label({
-                text: modeName === 'drun' && item.pinned ? '📌' : '',
-                style_class: 'dmenu-pin-marker',
-                y_align: Clutter.ActorAlign.CENTER,
-            });
+            if (modeName === 'drun') {
+                const pinMarker = new St.Label({
+                    text: item.pinned ? '📌' : '',
+                    style_class: 'dmenu-pin-marker',
+                    y_align: Clutter.ActorAlign.CENTER,
+                });
+                row.add_child(pinMarker);
+            }
 
             let iconActor = null;
             if (item.icon) {
@@ -1163,9 +1170,6 @@ class DmenuView {
             label.clutter_text.set_markup(
                 highlightLabel(item.label, tokens)
             );
-
-            row.add_child(marker);
-            row.add_child(pinMarker);
 
             if (iconActor)
                 row.add_child(iconActor);
