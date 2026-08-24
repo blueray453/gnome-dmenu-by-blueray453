@@ -1239,6 +1239,7 @@ class DmenuView {
 
             row.connect('enter-event', () => {
                 label.add_style_class_name('dmenu-result-hover');
+                this._controller.selectIndex(rowIndex);
                 return Clutter.EVENT_PROPAGATE;
             });
 
@@ -1407,6 +1408,43 @@ class DmenuView {
     _handleTextChanged() {
         this._controller.scheduleSearchUpdate();
     }
+
+    updateSelection(selectedIndex, visibleItems, showPreview) {
+        // Reset style on all rows
+        for (let i = 0; i < this._rowActors.length; i++) {
+            const row = this._rowActors[i];
+            // The label is the last child (after icon & markers)
+            const label = row.get_last_child();
+            if (label && label.has_style_class_name) {
+                label.remove_style_class_name('dmenu-result-selected');
+            }
+        }
+
+        // Apply selected style to the new row
+        if (selectedIndex >= 0 && selectedIndex < this._rowActors.length) {
+            const row = this._rowActors[selectedIndex];
+            const label = row.get_last_child();
+            if (label && label.add_style_class_name) {
+                label.add_style_class_name('dmenu-result-selected');
+            }
+        }
+
+        // Update preview if supported
+        if (showPreview && visibleItems.length > 0) {
+            const selectedItem = visibleItems[selectedIndex];
+            if (selectedItem?.data instanceof Meta.Window) {
+                this._controller._preview.show(
+                    selectedItem.data,
+                    this._previewWidth,
+                    this._previewHeight
+                );
+            } else {
+                this._controller._preview.hide();
+            }
+        } else {
+            this._controller._preview.hide();
+        }
+    }
 }
 
 // ============================================================
@@ -1442,6 +1480,8 @@ class DmenuController {
         this._showPreview = false;
         this._previewWidth = 0;
         this._previewHeight = 0;
+
+        this._currentVisibleItems = [];
 
         this._favoritesChangedId = this._drunMode.isFavoriteChangedListener(() => {
             if (!this._isOpen || this._modeName !== 'drun')
@@ -1521,8 +1561,12 @@ class DmenuController {
         if (count === 0)
             return;
 
-        this._selection.index = Math.max(0, Math.min(index, count - 1));
-        this._render();
+        const newIndex = Math.max(0, Math.min(index, count - 1));
+        if (this._selection.index === newIndex)
+            return; // no change – prevents unnecessary updates
+
+        this._selection.index = newIndex;
+        this._updateSelectionOnly(); // fast path: only styles + preview
     }
 
     removeItemByData(data) {
@@ -1783,6 +1827,7 @@ class DmenuController {
 
     _render() {
         const items = this._search.visibleItems;
+        this._currentVisibleItems = items;
 
         this._view.renderResults(
             items,
@@ -1793,21 +1838,8 @@ class DmenuController {
             this._multi
         );
 
-        if (this._showPreview && items.length > 0) {
-            const selectedItem = items[this._selection.index];
-
-            if (selectedItem?.data instanceof Meta.Window) {
-                this._preview.show(
-                    selectedItem.data,
-                    this._previewWidth,
-                    this._previewHeight
-                );
-            } else {
-                this._preview.hide();
-            }
-        } else {
-            this._preview.hide();
-        }
+        // Now update the selection and preview without rebuilding everything
+        this._updateSelectionOnly();
     }
 
     _renderPinnedBar() {
@@ -1863,6 +1895,15 @@ class DmenuController {
             return [items[this._selection.index]];
 
         return [];
+    }
+
+    _updateSelectionOnly() {
+        const items = this._search.visibleItems;
+        this._view.updateSelection(
+            this._selection.index,
+            items,
+            this._showPreview
+        );
     }
 }
 
@@ -2151,5 +2192,10 @@ export default class SimpleDmenuExtension extends Extension {
 
     showPaths(paths, multi = false, hint = null, fullscreen = false) {
         this._controller.showPaths(paths, multi, hint, fullscreen);
+    }
+
+    // Get the row actor at a given index (for possible future use)
+    getRowAt(index) {
+        return this._rowActors[index] || null;
     }
 }
