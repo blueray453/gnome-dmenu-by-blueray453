@@ -735,16 +735,10 @@ class DrunMode {
 
         return apps.map(app => {
             let shellApp = null;
-
             try {
                 if (appSystem && typeof appSystem.lookup_app === 'function')
                     shellApp = appSystem.lookup_app(app.get_id());
-            } catch (e) {
-                journal(
-                    `Could not get Shell.App for ${app.get_id()}: ${e.message}`,
-                    true
-                );
-            }
+            } catch (e) { }
 
             return new MenuItem({
                 label: app.get_name(),
@@ -757,22 +751,40 @@ class DrunMode {
         });
     }
 
-    activate(item) {
-        const app = item?.data;
-        if (!app || typeof app.launch !== 'function')
-            return;
-
+    // -------------------- ROBUST LAUNCHER (same as appSearchOverlay) --------------------
+    _launchApp(app) {
         try {
-            app.launch([], null);
+            const isShellApp = typeof app.get_id === 'function' && typeof app.get_name === 'function';
+            if (isShellApp) {
+                app.launch(global.get_current_time(), -1, 0);
+            } else {
+                app.launch([], null);
+            }
+            return true;
         } catch (e) {
-            journal(`Failed to launch ${item.label}: ${e.message}`, true);
+            // Fallback: try the other signature
+            try {
+                if (typeof app.get_id === 'function' && typeof app.get_name === 'function') {
+                    app.launch([], null);
+                } else {
+                    app.launch(global.get_current_time(), -1, 0);
+                }
+                return true;
+            } catch (e2) {
+                journal(`Launch failed: ${e2.message}`, true);
+                return false;
+            }
         }
     }
 
-    togglePin(item) {
-        if (!item)
-            return;
+    activate(item) {
+        const app = item?.data;
+        if (!app) return;
+        this._launchApp(app);
+    }
 
+    togglePin(item) {
+        if (!item) return;
         if (this._favorites.isFavorite(item.id))
             this._favorites.removeFavorite(item.id);
         else
@@ -788,22 +800,15 @@ class DrunMode {
     }
 
     disconnectFavoriteListener(id) {
-        if (!id)
-            return;
-
+        if (!id) return;
         try {
             this._favorites.disconnect(id);
-        } catch (e) {
-            journal(`Failed to disconnect favorites signal: ${e.message}`, true);
-        }
+        } catch (e) { }
     }
 
     activatePinned(app) {
-        try {
-            app.launch([], null);
-        } catch (e) {
-            journal(`Failed to launch ${app.get_name()}: ${e.message}`, true);
-        }
+        if (!app) return;
+        this._launchApp(app);
     }
 }
 
