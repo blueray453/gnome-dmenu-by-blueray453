@@ -67,46 +67,21 @@ const DBUS_INTERFACE = `<node>
 
 // ============================================================
 // LAYOUT CONSTANTS
-// Single source of truth for every dimension that layout/positioning
-// math elsewhere in this file also depends on. These are applied to
-// actors via set_style() at creation time instead of living in
-// stylesheet.css — so there is never a second copy of a number to
-// keep in sync. Change a value here and both the visuals and the
-// layout math move together automatically.
-//
-// Anything NOT listed here (colors, fonts, border-radius, hover
-// states, transitions) has no bearing on layout math and stays in
-// stylesheet.css as normal, freely-editable CSS.
 // ============================================================
 
 const LAYOUT = {
-    // .dmenu-container
     CONTAINER_PADDING: 32,
-
-    // result row marker columns (dmenu-marker / dmenu-pin-marker)
     MULTI_MARKER_WIDTH: 44,
     PIN_MARKER_WIDTH: 40,
-
-    // result row icon
     RESULT_ICON_SIZE: 48,
-
-    // pinned app bar icon
     PINNED_ICON_SIZE: 48,
-
-    // .dmenu-preview-box
     PREVIEW_BOX_MARGIN: 4,
-
-    // window clone close button
     CLOSE_BUTTON_SIZE: 48,
     CLOSE_BUTTON_MARGIN: 10,
     CLOSE_BUTTON_ICON_SIZE: 32,
-
-    // window clone title overlay
     TITLE_HEIGHT_MIN: 60,
     TITLE_HEIGHT_MAX: 140,
     TITLE_HEIGHT_FRACTION: 0.25,
-
-    // centered (non-fullscreen) preview view sizing
     CENTERED_WIDTH_FRAC: 0.9,
     CENTERED_HEIGHT_FRAC: 0.8,
     LEFT_RAIL_FRAC: 0.25,
@@ -114,8 +89,6 @@ const LAYOUT = {
     PREVIEW_MIN_WIDTH: 400,
     LEFT_RAIL_FALLBACK_WIDTH: 200,
     RAIL_GAP: 10,
-
-    // non-preview (stdin/paths/drun) centered view sizing
     STDIN_MAX_WIDTH: 1000,
     STDIN_MAX_HEIGHT: 600,
     STDIN_MARGIN: 100,
@@ -420,10 +393,6 @@ class AppMenuController {
 
 // ============================================================
 // SHARED CLONE-PREVIEW BUILDER
-// Same technique used by the workspace-thumbnails extension: corrects
-// for mutter's invisible shadow margin (buffer_rect vs frame_rect) so
-// the clipped clone shows only the visible window content, scaled and
-// centered exactly to targetHeight.
 // ============================================================
 
 function createClonePreviewActor(window, targetHeight, options = {}) {
@@ -507,8 +476,7 @@ class WindowPreview {
         this._window = null;
         this._unmanagedId = 0;
 
-        this._wrapper = null; // plain Clutter.Actor for absolute positioning
-        // inside the BoxLayout container
+        this._wrapper = null;
         this._clone = null;
         this._title = null;
     }
@@ -533,8 +501,6 @@ class WindowPreview {
             return;
         }
 
-        // Clone fits the full box again — no more room reserved for a
-        // separate title band above it.
         const aspect = windowFrame.width / windowFrame.height;
         let targetHeight = height;
         let targetWidth = targetHeight * aspect;
@@ -565,11 +531,8 @@ class WindowPreview {
         this._clone = built.actor;
         this._wrapper.add_child(this._clone);
 
-        // Title overlays the clone, centered within the clone's own
-        // bounds (not the full preview box) — matches the original
-        // "floating label over the middle of the window" look.
         this._title = this._buildTitle(window, built.width, built.height);
-        const titleHeight = this._title.height; // set via set_size() in _buildTitle
+        const titleHeight = this._title.height;
         this._title.set_position(
             cloneX,
             cloneY + (built.height - titleHeight) / 2
@@ -1237,6 +1200,8 @@ class DmenuView {
 
             row.add_child(label);
 
+            const rowIndex = i;
+
             row.connect('enter-event', () => {
                 label.add_style_class_name('dmenu-result-hover');
                 this._controller.selectIndex(rowIndex);
@@ -1247,8 +1212,6 @@ class DmenuView {
                 label.remove_style_class_name('dmenu-result-hover');
                 return Clutter.EVENT_PROPAGATE;
             });
-
-            const rowIndex = i;
 
             row.connect('button-press-event', (actor, event) => {
                 const button = event.get_button();
@@ -1279,6 +1242,43 @@ class DmenuView {
         }
 
         this.scrollSelectedIntoView(selectedIndex);
+    }
+
+    // NEW METHOD: Update only selection style and preview without rebuilding rows
+    updateSelection(selectedIndex, visibleItems, showPreview) {
+        // Reset style on all rows
+        for (let i = 0; i < this._rowActors.length; i++) {
+            const row = this._rowActors[i];
+            const label = row.get_last_child();
+            if (label && label.has_style_class_name) {
+                label.remove_style_class_name('dmenu-result-selected');
+            }
+        }
+
+        // Apply selected style to the new row
+        if (selectedIndex >= 0 && selectedIndex < this._rowActors.length) {
+            const row = this._rowActors[selectedIndex];
+            const label = row.get_last_child();
+            if (label && label.add_style_class_name) {
+                label.add_style_class_name('dmenu-result-selected');
+            }
+        }
+
+        // Update preview if supported
+        if (showPreview && visibleItems.length > 0) {
+            const selectedItem = visibleItems[selectedIndex];
+            if (selectedItem?.data instanceof Meta.Window) {
+                this._controller._preview.show(
+                    selectedItem.data,
+                    this._controller._previewWidth,
+                    this._controller._previewHeight
+                );
+            } else {
+                this._controller._preview.hide();
+            }
+        } else {
+            this._controller._preview.hide();
+        }
     }
 
     renderPinnedApps(apps) {
@@ -1408,43 +1408,6 @@ class DmenuView {
     _handleTextChanged() {
         this._controller.scheduleSearchUpdate();
     }
-
-    updateSelection(selectedIndex, visibleItems, showPreview) {
-        // Reset style on all rows
-        for (let i = 0; i < this._rowActors.length; i++) {
-            const row = this._rowActors[i];
-            // The label is the last child (after icon & markers)
-            const label = row.get_last_child();
-            if (label && label.has_style_class_name) {
-                label.remove_style_class_name('dmenu-result-selected');
-            }
-        }
-
-        // Apply selected style to the new row
-        if (selectedIndex >= 0 && selectedIndex < this._rowActors.length) {
-            const row = this._rowActors[selectedIndex];
-            const label = row.get_last_child();
-            if (label && label.add_style_class_name) {
-                label.add_style_class_name('dmenu-result-selected');
-            }
-        }
-
-        // Update preview if supported
-        if (showPreview && visibleItems.length > 0) {
-            const selectedItem = visibleItems[selectedIndex];
-            if (selectedItem?.data instanceof Meta.Window) {
-                this._controller._preview.show(
-                    selectedItem.data,
-                    this._previewWidth,
-                    this._previewHeight
-                );
-            } else {
-                this._controller._preview.hide();
-            }
-        } else {
-            this._controller._preview.hide();
-        }
-    }
 }
 
 // ============================================================
@@ -1480,8 +1443,7 @@ class DmenuController {
         this._showPreview = false;
         this._previewWidth = 0;
         this._previewHeight = 0;
-
-        this._currentVisibleItems = [];
+        this._currentVisibleItems = []; // added for optimization
 
         this._favoritesChangedId = this._drunMode.isFavoriteChangedListener(() => {
             if (!this._isOpen || this._modeName !== 'drun')
@@ -1556,6 +1518,7 @@ class DmenuController {
         this._view.destroy();
     }
 
+    // OPTIMIZED: only updates selection and preview, no full rebuild
     selectIndex(index) {
         const count = this._search.visibleItems.length;
         if (count === 0)
@@ -1563,10 +1526,20 @@ class DmenuController {
 
         const newIndex = Math.max(0, Math.min(index, count - 1));
         if (this._selection.index === newIndex)
-            return; // no change – prevents unnecessary updates
+            return; // no change
 
         this._selection.index = newIndex;
-        this._updateSelectionOnly(); // fast path: only styles + preview
+        this._updateSelectionOnly(); // fast path
+    }
+
+    // NEW: update selection and preview without rebuilding rows
+    _updateSelectionOnly() {
+        const items = this._search.visibleItems;
+        this._view.updateSelection(
+            this._selection.index,
+            items,
+            this._showPreview
+        );
     }
 
     removeItemByData(data) {
@@ -1622,7 +1595,7 @@ class DmenuController {
             if (visibleCount > 0) {
                 this._appMenu.close();
                 this._selection.moveDown(visibleCount);
-                this._render();
+                this._updateSelectionOnly();
             }
             return Clutter.EVENT_STOP;
         }
@@ -1631,7 +1604,7 @@ class DmenuController {
             if (visibleCount > 0) {
                 this._appMenu.close();
                 this._selection.moveUp(visibleCount);
-                this._render();
+                this._updateSelectionOnly();
             }
             return Clutter.EVENT_STOP;
         }
@@ -1649,14 +1622,14 @@ class DmenuController {
         if (sym === Clutter.KEY_Tab) {
             this._toggleCurrent();
             this._selection.next(visibleCount);
-            this._render();
+            this._updateSelectionOnly();
             return Clutter.EVENT_STOP;
         }
 
         if (sym === Clutter.KEY_space &&
             (mods & Clutter.ModifierType.CONTROL_MASK)) {
             this._toggleCurrent();
-            this._render();
+            this._updateSelectionOnly();
             return Clutter.EVENT_STOP;
         }
 
@@ -1664,7 +1637,7 @@ class DmenuController {
             (mods & Clutter.ModifierType.SHIFT_MASK)) {
             this._toggleCurrent();
             this._selection.next(visibleCount);
-            this._render();
+            this._updateSelectionOnly();
             return Clutter.EVENT_STOP;
         }
 
@@ -1743,7 +1716,6 @@ class DmenuController {
             ? options
             : new DmenuOptions(options);
 
-        // Unsupported mode options are intentionally ignored.
         const effectiveOptions = new DmenuOptions({
             multi: capabilities.multi ? requested.multi : false,
             hint: capabilities.hint ? requested.hint : null,
@@ -1825,6 +1797,7 @@ class DmenuController {
         }
     }
 
+    // OPTIMIZED: full rebuild (rows) only when filter changes
     _render() {
         const items = this._search.visibleItems;
         this._currentVisibleItems = items;
@@ -1838,7 +1811,7 @@ class DmenuController {
             this._multi
         );
 
-        // Now update the selection and preview without rebuilding everything
+        // Now update the selection and preview using the newly built rows
         this._updateSelectionOnly();
     }
 
@@ -1895,15 +1868,6 @@ class DmenuController {
             return [items[this._selection.index]];
 
         return [];
-    }
-
-    _updateSelectionOnly() {
-        const items = this._search.visibleItems;
-        this._view.updateSelection(
-            this._selection.index,
-            items,
-            this._showPreview
-        );
     }
 }
 
@@ -2192,10 +2156,5 @@ export default class SimpleDmenuExtension extends Extension {
 
     showPaths(paths, multi = false, hint = null, fullscreen = false) {
         this._controller.showPaths(paths, multi, hint, fullscreen);
-    }
-
-    // Get the row actor at a given index (for possible future use)
-    getRowAt(index) {
-        return this._rowActors[index] || null;
     }
 }
