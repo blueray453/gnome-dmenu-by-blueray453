@@ -10,7 +10,13 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as AppFavorites from 'resource:///org/gnome/shell/ui/appFavorites.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import { AppMenu } from 'resource:///org/gnome/shell/ui/appMenu.js';
-import { setLogging, setLogFn, journal } from './utils.js';
+
+import {
+    initLogging,
+    createLogger,
+} from './logger.js';
+
+const journal = createLogger(import.meta.url);
 
 // ============================================================
 // CONSTANTS
@@ -2108,24 +2114,8 @@ export default class SimpleDmenuExtension extends Extension {
     }
 
     enable() {
-        setLogFn((msg, error = false) => {
-            const level = error
-                ? GLib.LogLevelFlags.LEVEL_CRITICAL
-                : GLib.LogLevelFlags.LEVEL_MESSAGE;
-
-            GLib.log_structured(
-                'gnome-dmenu-by-blueray453',
-                level,
-                {
-                    MESSAGE: `${msg}`,
-                    SYSLOG_IDENTIFIER: 'gnome-dmenu-by-blueray453',
-                    CODE_FILE: GLib.filename_from_uri(import.meta.url)[0],
-                }
-            );
-        });
-
-        setLogging(true);
-        journal('Enabled');
+        initLogging(this.uuid, 'both', false);
+        journal(`Enabled`);
 
         this._service = new DmenuService(this);
         this._service.export();
