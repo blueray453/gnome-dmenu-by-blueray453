@@ -11,10 +11,7 @@ import * as AppFavorites from 'resource:///org/gnome/shell/ui/appFavorites.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import { AppMenu } from 'resource:///org/gnome/shell/ui/appMenu.js';
 
-import {
-    initLogging,
-    createLogger,
-} from './logger.js';
+import { initLogging, createLogger } from './logger.js';
 
 const journal = createLogger(import.meta.url);
 
@@ -22,11 +19,7 @@ const journal = createLogger(import.meta.url);
 // CONSTANTS
 // ============================================================
 
-const SPEC_CACHE_DIR = GLib.build_filenamev([
-    GLib.get_home_dir(),
-    '.cache',
-    'gnome-dbus-spec',
-]);
+const SPEC_CACHE_DIR = GLib.build_filenamev([GLib.get_home_dir(), '.cache', 'gnome-dbus-spec']);
 const SPEC_CACHE_FILE = 'simple-dmenu.json';
 
 const BUS_NAME = 'io.github.blueray453.SimpleDmenu';
@@ -71,10 +64,6 @@ const DBUS_INTERFACE = `<node>
   </interface>
 </node>`;
 
-// ============================================================
-// LAYOUT CONSTANTS
-// ============================================================
-
 const LAYOUT = {
     CONTAINER_PADDING: 32,
     MULTI_MARKER_WIDTH: 44,
@@ -102,6 +91,75 @@ const LAYOUT = {
 };
 
 // ============================================================
+// MODULE STATE
+//
+// Everything the extension tracks at runtime lives here. The logic below is
+// plain functions reading and writing this object, so there is exactly one
+// place to look for "what state does this extension keep".
+//
+// Objects that own a widget tree or a per-instance signal lifecycle
+// (DmenuView, WindowPreview) remain classes and are stored here as
+// references. The controller logic that orchestrates them is module-level.
+// ============================================================
+
+const state = {
+    // Extension context
+    extensionPath: null,
+
+    // Data
+    search: { allItems: [], visibleItems: [], tokens: [] },
+    selection: { index: 0, selectedIds: new Set() },
+
+    // Widgets and controllers (classes)
+    view: null,
+    preview: null,
+    appMenu: { menuManager: null, openMenu: null },
+
+    // Modes — dispatcher is a switch on modeName, so only the name is kept.
+    modeName: 'stdin',
+
+    // Flags
+    isOpen: false,
+    multi: false,
+    fullscreen: false,
+    showPreview: false,
+    previewWidth: 0,
+    previewHeight: 0,
+
+    // Timers
+    filterTimeoutId: 0,
+
+    // Favorites (cached at controller setup so signals can be disconnected)
+    favorites: null,
+    favoritesChangedId: 0,
+
+    // D-Bus
+    dbusImpl: null,
+    ownerId: 0,
+};
+
+function resetState() {
+    state.extensionPath = null;
+    state.search = { allItems: [], visibleItems: [], tokens: [] };
+    state.selection = { index: 0, selectedIds: new Set() };
+    state.view = null;
+    state.preview = null;
+    state.appMenu = { menuManager: null, openMenu: null };
+    state.modeName = 'stdin';
+    state.isOpen = false;
+    state.multi = false;
+    state.fullscreen = false;
+    state.showPreview = false;
+    state.previewWidth = 0;
+    state.previewHeight = 0;
+    state.filterTimeoutId = 0;
+    state.favorites = null;
+    state.favoritesChangedId = 0;
+    state.dbusImpl = null;
+    state.ownerId = 0;
+}
+
+// ============================================================
 // HELPERS
 // ============================================================
 
@@ -116,12 +174,8 @@ function highlightLabel(label, tokens) {
     for (const token of tokens) {
         const lowerToken = token.toLowerCase();
         let idx = lowerLabel.indexOf(lowerToken);
-
         while (idx !== -1) {
-            intervals.push({
-                start: idx,
-                end: idx + lowerToken.length,
-            });
+            intervals.push({ start: idx, end: idx + lowerToken.length });
             idx = lowerLabel.indexOf(lowerToken, idx + 1);
         }
     }
@@ -135,7 +189,6 @@ function highlightLabel(label, tokens) {
     for (let i = 1; i < intervals.length; i++) {
         const last = merged[merged.length - 1];
         const cur = intervals[i];
-
         if (cur.start <= last.end)
             last.end = Math.max(last.end, cur.end);
         else
@@ -144,15 +197,12 @@ function highlightLabel(label, tokens) {
 
     let markup = '';
     let pos = 0;
-
     for (const interval of merged) {
         if (interval.start > pos)
             markup += escaped.substring(pos, interval.start);
-
         markup += `<b>${escaped.substring(interval.start, interval.end)}</b>`;
         pos = interval.end;
     }
-
     if (pos < escaped.length)
         markup += escaped.substring(pos);
 
@@ -163,237 +213,154 @@ function highlightLabel(label, tokens) {
 // DATA MODEL
 // ============================================================
 
-class MenuItem {
-    constructor({
-        id,
-        label,
-        icon = null,
-        data = null,
-        shellApp = null,
-        pinned = false,
-    }) {
-        this.id = id;
-        this.label = label;
-        this.icon = icon;
-        this.data = data;
-        this.shellApp = shellApp;
-        this.pinned = pinned;
-    }
-}
-
-// ============================================================
-// SHARED OPTIONS
-// ============================================================
-
-class DmenuOptions {
-    constructor({
-        multi = false,
-        hint = null,
-        fullscreen = false,
-    } = {}) {
-        this.multi = Boolean(multi);
-        this.hint = hint || null;
-        this.fullscreen = Boolean(fullscreen);
-    }
-
-    static from(multi = false, hint = null, fullscreen = false) {
-        return new DmenuOptions({ multi, hint, fullscreen });
-    }
+function makeMenuItem({
+    id,
+    label,
+    icon = null,
+    data = null,
+    shellApp = null,
+    pinned = false,
+}) {
+    return { id, label, icon, data, shellApp, pinned };
 }
 
 // ============================================================
 // SEARCH MODEL
 // ============================================================
 
-class SearchModel {
-    constructor() {
-        this._allItems = [];
-        this._visibleItems = [];
-        this._tokens = [];
+function searchSetItems(items) {
+    state.search.allItems = [...items];
+    state.search.visibleItems = [...items];
+}
+
+function searchSetQuery(query) {
+    const filter = (query || '').trim().toLowerCase();
+    state.search.tokens = filter.split(/\s+/).filter(Boolean);
+
+    if (state.search.tokens.length === 0) {
+        state.search.visibleItems = [...state.search.allItems];
+        return state.search.visibleItems;
     }
 
-    setItems(items) {
-        this._allItems = [...items];
-        this._visibleItems = [...items];
-    }
+    state.search.visibleItems = state.search.allItems.filter(item => {
+        const lower = item.label.toLowerCase();
+        return state.search.tokens.every(token => lower.includes(token));
+    });
 
-    get allItems() {
-        return this._allItems;
-    }
+    return state.search.visibleItems;
+}
 
-    get visibleItems() {
-        return this._visibleItems;
-    }
+function searchRemoveItemByData(data) {
+    const before = state.search.allItems.length;
+    state.search.allItems = state.search.allItems.filter(item => item.data !== data);
+    return before !== state.search.allItems.length;
+}
 
-    get tokens() {
-        return this._tokens;
-    }
+function searchRemoveItemById(id) {
+    const normalized = String(id);
+    const before = state.search.allItems.length;
+    state.search.allItems = state.search.allItems.filter(item => String(item.id) !== normalized);
+    return before !== state.search.allItems.length;
+}
 
-    setQuery(query) {
-        const filter = (query || '').trim().toLowerCase();
-        this._tokens = filter.split(/\s+/).filter(Boolean);
-
-        if (this._tokens.length === 0) {
-            this._visibleItems = [...this._allItems];
-            return this._visibleItems;
-        }
-
-        this._visibleItems = this._allItems.filter(item => {
-            const lower = item.label.toLowerCase();
-            return this._tokens.every(token => lower.includes(token));
-        });
-
-        return this._visibleItems;
-    }
-
-    removeItemByData(data) {
-        const before = this._allItems.length;
-        this._allItems = this._allItems.filter(item => item.data !== data);
-        return before !== this._allItems.length;
-    }
-
-    removeItemById(id) {
-        const normalized = String(id);
-        const before = this._allItems.length;
-
-        this._allItems = this._allItems.filter(
-            item => String(item.id) !== normalized
-        );
-
-        return before !== this._allItems.length;
-    }
-
-    updateItem(id, updater) {
-        const item = this._allItems.find(item => String(item.id) === String(id));
-        if (!item)
-            return false;
-
-        updater(item);
-        return true;
-    }
+function searchUpdateItem(id, updater) {
+    const item = state.search.allItems.find(item => String(item.id) === String(id));
+    if (!item) return false;
+    updater(item);
+    return true;
 }
 
 // ============================================================
 // SELECTION MODEL
 // ============================================================
 
-class SelectionModel {
-    constructor() {
-        this.index = 0;
-        this.selectedIds = new Set();
-    }
+function selectionReset() {
+    state.selection.index = 0;
+    state.selection.selectedIds.clear();
+}
 
-    reset() {
-        this.index = 0;
-        this.selectedIds.clear();
-    }
+function selectionClamp(count) {
+    if (count <= 0) { state.selection.index = 0; return; }
+    state.selection.index = Math.max(0, Math.min(state.selection.index, count - 1));
+}
 
-    clamp(count) {
-        if (count <= 0) {
-            this.index = 0;
-            return;
-        }
+function selectionMoveUp(count) {
+    if (count <= 0) return;
+    state.selection.index = Math.max(0, state.selection.index - 1);
+}
 
-        this.index = Math.max(0, Math.min(this.index, count - 1));
-    }
+function selectionMoveDown(count) {
+    if (count <= 0) return;
+    state.selection.index = Math.min(count - 1, state.selection.index + 1);
+}
 
-    moveUp(count) {
-        if (count <= 0)
-            return;
+function selectionNext(count) {
+    if (count <= 0) return;
+    state.selection.index = Math.min(count - 1, state.selection.index + 1);
+}
 
-        this.index = Math.max(0, this.index - 1);
-    }
+function selectionToggle(item) {
+    if (!item) return;
+    if (state.selection.selectedIds.has(item.id))
+        state.selection.selectedIds.delete(item.id);
+    else
+        state.selection.selectedIds.add(item.id);
+}
 
-    moveDown(count) {
-        if (count <= 0)
-            return;
+function selectionClear() {
+    state.selection.selectedIds.clear();
+}
 
-        this.index = Math.min(count - 1, this.index + 1);
-    }
-
-    next(count) {
-        if (count <= 0)
-            return;
-
-        this.index = Math.min(count - 1, this.index + 1);
-    }
-
-    toggle(item) {
-        if (!item)
-            return;
-
-        if (this.selectedIds.has(item.id))
-            this.selectedIds.delete(item.id);
-        else
-            this.selectedIds.add(item.id);
-    }
-
-    clear() {
-        this.selectedIds.clear();
-    }
-
-    getSelectedItems(items) {
-        if (this.selectedIds.size === 0)
-            return [];
-
-        return items.filter(item => this.selectedIds.has(item.id));
-    }
+function selectionGetSelectedItems(items) {
+    if (state.selection.selectedIds.size === 0) return [];
+    return items.filter(item => state.selection.selectedIds.has(item.id));
 }
 
 // ============================================================
 // APP MENU CONTROLLER
 // ============================================================
 
-class AppMenuController {
-    constructor(sourceActor) {
-        this._sourceActor = sourceActor;
-        this._menuManager = new PopupMenu.PopupMenuManager(sourceActor);
-        this._openMenu = null;
-    }
+function appMenuInit(sourceActor) {
+    state.appMenu.menuManager = new PopupMenu.PopupMenuManager(sourceActor);
+}
 
-    openForApp(sourceActor, app) {
-        this.close();
+function appMenuOpenForApp(sourceActor, app) {
+    appMenuClose();
 
-        const menu = new AppMenu(sourceActor, St.Side.BOTTOM, {
-            favoritesSection: true,
-            showSingleWindows: true,
-        });
+    const menu = new AppMenu(sourceActor, St.Side.BOTTOM, {
+        favoritesSection: true,
+        showSingleWindows: true,
+    });
 
-        menu.actor.add_style_class_name('dmenu-context-menu');
+    menu.actor.add_style_class_name('dmenu-context-menu');
 
-        Main.layoutManager.addChrome(menu.actor);
-        menu.actor.hide();
-        this._menuManager.addMenu(menu);
+    Main.layoutManager.addChrome(menu.actor);
+    menu.actor.hide();
+    state.appMenu.menuManager.addMenu(menu);
 
-        menu.setApp(app);
+    menu.setApp(app);
+    state.appMenu.openMenu = menu;
 
-        this._openMenu = menu;
-
-        menu.connect('open-state-changed', (o, isOpen) => {
-            if (!isOpen) {
-                if (menu === this._openMenu)
-                    this._openMenu = null;
-
-                menu.destroy();
-            }
-        });
-
-        menu.open(true);
-        return menu;
-    }
-
-    close() {
-        if (!this._openMenu)
-            return;
-
-        const menu = this._openMenu;
-        this._openMenu = null;
-
-        try {
-            menu.close();
-        } catch (e) {
-            journal(`Failed to close app menu: ${e.message}`, true);
+    menu.connect('open-state-changed', (o, isOpen) => {
+        if (!isOpen) {
+            if (menu === state.appMenu.openMenu)
+                state.appMenu.openMenu = null;
+            menu.destroy();
         }
+    });
+
+    menu.open(true);
+    return menu;
+}
+
+function appMenuClose() {
+    if (!state.appMenu.openMenu) return;
+    const menu = state.appMenu.openMenu;
+    state.appMenu.openMenu = null;
+    try {
+        menu.close();
+    } catch (e) {
+        journal(`Failed to close app menu: ${e.message}`, true);
     }
 }
 
@@ -445,7 +412,6 @@ function createClonePreviewActor(window, targetHeight, options = {}) {
         const closeOffsetX = options.closeButtonOffsetX ?? (closeButtonSize + LAYOUT.CLOSE_BUTTON_MARGIN);
         const closeOffsetY = options.closeButtonOffsetY ?? LAYOUT.CLOSE_BUTTON_MARGIN;
 
-
         const closeButton = new St.Button({
             style_class: 'window-close-button',
             child: new St.Icon({
@@ -471,17 +437,16 @@ function createClonePreviewActor(window, targetHeight, options = {}) {
 }
 
 // ============================================================
-// WINDOW PREVIEW / CLONE
+// WINDOW PREVIEW (class — owns a Clutter actor subtree and a
+// per-window 'unmanaged' signal that needs explicit teardown)
 // ============================================================
 
 class WindowPreview {
     constructor(container, onWindowClosed = null) {
         this._container = container;
         this._onWindowClosed = onWindowClosed;
-
         this._window = null;
         this._unmanagedId = 0;
-
         this._wrapper = null;
         this._clone = null;
         this._title = null;
@@ -522,10 +487,7 @@ class WindowPreview {
             closeButtonOffsetY: LAYOUT.CLOSE_BUTTON_MARGIN,
         });
 
-        if (!built) {
-            this.hide();
-            return;
-        }
+        if (!built) { this.hide(); return; }
 
         this._wrapper = new Clutter.Actor({ width, height });
         this._container.add_child(this._wrapper);
@@ -539,10 +501,7 @@ class WindowPreview {
 
         this._title = this._buildTitle(window, built.width, built.height);
         const titleHeight = this._title.height;
-        this._title.set_position(
-            cloneX,
-            cloneY + (built.height - titleHeight) / 2
-        );
+        this._title.set_position(cloneX, cloneY + (built.height - titleHeight) / 2);
         this._wrapper.add_child(this._title);
     }
 
@@ -571,27 +530,22 @@ class WindowPreview {
     _connectWindowLifecycle(window) {
         this._unmanagedId = window.connect('unmanaged', () => {
             this._unmanagedId = 0;
-
             const closedWindow = this._window;
             this._window = null;
             this._clearClone();
             this._container.remove_all_children();
-
             if (this._onWindowClosed)
                 this._onWindowClosed(closedWindow);
         });
     }
 
     _disconnectWindowLifecycle() {
-        if (!this._window || !this._unmanagedId)
-            return;
-
+        if (!this._window || !this._unmanagedId) return;
         try {
             this._window.disconnect(this._unmanagedId);
         } catch (e) {
             journal(`Failed to disconnect window preview signal: ${e.message}`, true);
         }
-
         this._unmanagedId = 0;
     }
 
@@ -630,314 +584,247 @@ class WindowPreview {
 }
 
 // ============================================================
-// WINDOW MODE
+// MODES
 // ============================================================
 
-class WindowMode {
-    constructor(controller) {
-        this._controller = controller;
-    }
+function windowModeGetCapabilities() {
+    return { multi: false, hint: true, fullscreen: true, preview: true };
+}
 
-    getCapabilities() {
-        return {
-            multi: false,
-            hint: true,
-            fullscreen: true,
-            preview: true,
-        };
-    }
+function windowModeGetItems() {
+    const windows = global.display.get_tab_list(Meta.TabList.NORMAL, null);
 
-    getItems() {
-        const windows = global.display.get_tab_list(
-            Meta.TabList.NORMAL,
-            null
-        );
+    let tracker;
+    if (typeof Shell.WindowTracker.get_default === 'function')
+        tracker = Shell.WindowTracker.get_default();
+    else
+        tracker = Main.windowTracker;
 
-        let tracker = null;
-        if (typeof Shell.WindowTracker.get_default === 'function')
-            tracker = Shell.WindowTracker.get_default();
-        else
-            tracker = Main.windowTracker;
+    return windows.map(window => {
+        let title = window.get_title();
+        if (!title || title.trim() === '')
+            title = 'Untitled';
 
-        return windows.map(window => {
-            let title = window.get_title();
-            if (!title || title.trim() === '')
-                title = 'Untitled';
+        const app = tracker ? tracker.get_window_app(window) : null;
+        const icon = app ? app.get_icon() : Gio.ThemedIcon.new('application-x-executable');
 
-            const app = tracker ? tracker.get_window_app(window) : null;
-            const icon = app
-                ? app.get_icon()
-                : Gio.ThemedIcon.new('application-x-executable');
-
-            return new MenuItem({
-                label: title,
-                icon,
-                data: window,
-                id: String(window.get_id()),
-            });
+        return makeMenuItem({
+            label: title,
+            icon,
+            data: window,
+            id: String(window.get_id()),
         });
-    }
+    });
+}
 
-    activate(item) {
-        const window = item?.data;
-        if (!window)
-            return;
+function windowModeActivate(item) {
+    const window = item?.data;
+    if (!window) return;
 
-        const timestamp = global.get_current_time();
-
-        try {
-            const workspace = window.get_workspace();
-            if (workspace)
-                workspace.activate_with_focus(window, timestamp);
-            else
-                window.activate(timestamp);
-        } catch (e) {
-            journal(`Failed to activate window ${item.label}: ${e.message}`, true);
-        }
-    }
-
-    handleClosedWindow(window) {
-        if (!window)
-            return;
-
-        journal(`[WindowMode] Window closed: ${window.get_title() || 'Untitled'}`);
-        this._controller.removeItemByData(window);
+    const timestamp = global.get_current_time();
+    try {
+        const workspace = window.get_workspace();
+        if (workspace)
+            workspace.activate_with_focus(window, timestamp);
+        else
+            window.activate(timestamp);
+    } catch (e) {
+        journal(`Failed to activate window ${item.label}: ${e.message}`, true);
     }
 }
 
-// ============================================================
-// DRUN MODE
-// ============================================================
+function windowModeHandleClosedWindow(window) {
+    if (!window) return;
+    journal(`[WindowMode] Window closed: ${window.get_title() || 'Untitled'}`);
+    removeItemByData(window);
+}
 
-class DrunMode {
-    constructor(controller) {
-        this._controller = controller;
-        this._favorites = AppFavorites.getAppFavorites();
-    }
+// ---- drun ----
 
-    getCapabilities() {
-        return {
-            multi: false,
-            hint: true,
-            fullscreen: true,
-            preview: false,
-        };
-    }
+function drunModeGetCapabilities() {
+    return { multi: false, hint: true, fullscreen: true, preview: false };
+}
 
-    getItems() {
-        const appSystem = Shell.AppSystem.get_default();
-        let apps = [];
+function drunModeGetItems() {
+    const appSystem = Shell.AppSystem.get_default();
+    let apps = [];
 
-        if (appSystem && typeof appSystem.get_all === 'function')
-            apps = appSystem.get_all().filter(app => app.should_show());
-        else
-            apps = Gio.AppInfo.get_all().filter(app => app.should_show());
+    if (appSystem && typeof appSystem.get_all === 'function')
+        apps = appSystem.get_all().filter(app => app.should_show());
+    else
+        apps = Gio.AppInfo.get_all().filter(app => app.should_show());
 
-        apps.sort((a, b) => a.get_name().localeCompare(b.get_name()));
+    apps.sort((a, b) => a.get_name().localeCompare(b.get_name()));
 
-        const favoriteIds = new Set(
-            this._favorites.getFavorites().map(app => app.get_id())
-        );
+    const favoriteIds = new Set(state.favorites.getFavorites().map(app => app.get_id()));
 
-        return apps.map(app => {
-            let shellApp = null;
-            try {
-                if (appSystem && typeof appSystem.lookup_app === 'function')
-                    shellApp = appSystem.lookup_app(app.get_id());
-            } catch (e) { }
-
-            return new MenuItem({
-                label: app.get_name(),
-                icon: app.get_icon(),
-                data: app,
-                shellApp,
-                id: app.get_id(),
-                pinned: favoriteIds.has(app.get_id()),
-            });
-        });
-    }
-
-    // -------------------- ROBUST LAUNCHER (same as appSearchOverlay) --------------------
-    _launchApp(app) {
+    return apps.map(app => {
+        let shellApp = null;
         try {
-            const isShellApp = typeof app.get_id === 'function' && typeof app.get_name === 'function';
-            if (isShellApp) {
-                app.launch(global.get_current_time(), -1, 0);
-            } else {
+            if (appSystem && typeof appSystem.lookup_app === 'function')
+                shellApp = appSystem.lookup_app(app.get_id());
+        } catch (e) { /* ignore */ }
+
+        return makeMenuItem({
+            label: app.get_name(),
+            icon: app.get_icon(),
+            data: app,
+            shellApp,
+            id: app.get_id(),
+            pinned: favoriteIds.has(app.get_id()),
+        });
+    });
+}
+
+function drunModeLaunchApp(app) {
+    try {
+        const isShellApp = typeof app.get_id === 'function' && typeof app.get_name === 'function';
+        if (isShellApp)
+            app.launch(global.get_current_time(), -1, 0);
+        else
+            app.launch([], null);
+        return true;
+    } catch (e) {
+        try {
+            if (typeof app.get_id === 'function' && typeof app.get_name === 'function')
                 app.launch([], null);
-            }
+            else
+                app.launch(global.get_current_time(), -1, 0);
             return true;
-        } catch (e) {
-            // Fallback: try the other signature
-            try {
-                if (typeof app.get_id === 'function' && typeof app.get_name === 'function') {
-                    app.launch([], null);
-                } else {
-                    app.launch(global.get_current_time(), -1, 0);
-                }
-                return true;
-            } catch (e2) {
-                journal(`Launch failed: ${e2.message}`, true);
-                return false;
-            }
+        } catch (e2) {
+            journal(`Launch failed: ${e2.message}`, true);
+            return false;
         }
     }
+}
 
-    activate(item) {
-        const app = item?.data;
-        if (!app) return;
-        this._launchApp(app);
-    }
+function drunModeActivate(item) {
+    const app = item?.data;
+    if (!app) return;
+    drunModeLaunchApp(app);
+}
 
-    togglePin(item) {
-        if (!item) return;
-        if (this._favorites.isFavorite(item.id))
-            this._favorites.removeFavorite(item.id);
-        else
-            this._favorites.addFavorite(item.id);
-    }
+function drunModeTogglePin(item) {
+    if (!item) return;
+    if (state.favorites.isFavorite(item.id))
+        state.favorites.removeFavorite(item.id);
+    else
+        state.favorites.addFavorite(item.id);
+}
 
-    getFavorites() {
-        return this._favorites.getFavorites();
-    }
+function drunModeGetFavorites() {
+    return state.favorites.getFavorites();
+}
 
-    isFavoriteChangedListener(callback) {
-        return this._favorites.connect('changed', callback);
-    }
+// ---- paths ----
 
-    disconnectFavoriteListener(id) {
-        if (!id) return;
+function pathModeGetCapabilities() {
+    return { multi: true, hint: true, fullscreen: true, preview: false };
+}
+
+function pathModeGetItems(paths) {
+    return paths.map(path => {
+        let icon = null;
         try {
-            this._favorites.disconnect(id);
-        } catch (e) { }
-    }
+            const file = Gio.File.new_for_path(path);
+            const info = file.query_info(
+                Gio.FILE_ATTRIBUTE_STANDARD_ICON,
+                Gio.FileQueryInfoFlags.NONE,
+                null
+            );
+            if (info) icon = info.get_icon();
+        } catch (e) {
+            icon = Gio.ThemedIcon.new('folder');
+        }
+        if (!icon) icon = Gio.ThemedIcon.new('folder');
 
-    activatePinned(app) {
-        if (!app) return;
-        this._launchApp(app);
-    }
-}
-
-// ============================================================
-// PATH MODE
-// ============================================================
-
-class PathMode {
-    constructor(controller) {
-        this._controller = controller;
-    }
-
-    getCapabilities() {
-        return {
-            multi: true,
-            hint: true,
-            fullscreen: true,
-            preview: false,
-        };
-    }
-
-    getItems(paths) {
-        return paths.map(path => {
-            let icon = null;
-
-            try {
-                const file = Gio.File.new_for_path(path);
-                const info = file.query_info(
-                    Gio.FILE_ATTRIBUTE_STANDARD_ICON,
-                    Gio.FileQueryInfoFlags.NONE,
-                    null
-                );
-
-                if (info)
-                    icon = info.get_icon();
-            } catch (e) {
-                icon = Gio.ThemedIcon.new('folder');
-            }
-
-            if (!icon)
-                icon = Gio.ThemedIcon.new('folder');
-
-            return new MenuItem({
-                label: path,
-                icon,
-                data: path,
-                id: path,
-            });
+        return makeMenuItem({
+            label: path,
+            icon,
+            data: path,
+            id: path,
         });
-    }
-
-    activate(item) {
-        return item?.data ?? null;
-    }
+    });
 }
 
-// ============================================================
-// GENERIC / STDIN MODE
-// ============================================================
+function pathModeActivate(item) {
+    return item?.data ?? null;
+}
 
-class GenericMode {
-    constructor(controller) {
-        this._controller = controller;
-    }
+// ---- generic / stdin ----
 
-    getCapabilities() {
-        return {
-            multi: true,
-            hint: true,
-            fullscreen: true,
-            preview: false,
-        };
-    }
+function genericModeGetCapabilities() {
+    return { multi: true, hint: true, fullscreen: true, preview: false };
+}
 
-    getItems(items) {
-        const idMap = new Map();
+function genericModeGetItems(items) {
+    const idMap = new Map();
 
-        return items.map((item, index) => {
-            let label;
-            let id;
+    return items.map((item, index) => {
+        let label;
+        let id;
 
-            if (typeof item === 'string') {
-                label = item;
-                id = item;
-            } else {
-                label = item.label;
-                id = item.id || item.label;
-            }
+        if (typeof item === 'string') {
+            label = item;
+            id = item;
+        } else {
+            label = item.label;
+            id = item.id || item.label;
+        }
 
-            if (idMap.has(id))
-                id = `${id}_${index}`;
+        if (idMap.has(id))
+            id = `${id}_${index}`;
 
-            idMap.set(id, true);
+        idMap.set(id, true);
 
-            return new MenuItem({
-                label,
-                icon: item.icon || null,
-                data: item.data || null,
-                id,
-            });
+        return makeMenuItem({
+            label,
+            icon: item.icon || null,
+            data: item.data || null,
+            id,
         });
-    }
+    });
+}
 
-    activate(item) {
-        return item?.label ?? null;
+function genericModeActivate(item) {
+    return item?.label ?? null;
+}
+
+// ---- mode dispatcher ----
+
+function getModeCapabilities(modeName) {
+    switch (modeName) {
+        case 'window': return windowModeGetCapabilities();
+        case 'drun': return drunModeGetCapabilities();
+        case 'paths': return pathModeGetCapabilities();
+        case 'stdin':
+        default: return genericModeGetCapabilities();
+    }
+}
+
+function activateInMode(modeName, item) {
+    switch (modeName) {
+        case 'window': windowModeActivate(item); return item.label;
+        case 'drun': drunModeActivate(item); return item.label;
+        case 'paths': return pathModeActivate(item);
+        case 'stdin':
+        default: return genericModeActivate(item);
     }
 }
 
 // ============================================================
-// MAIN VIEW
+// MAIN VIEW (class — owns a widget hierarchy with self-attached
+// signal handlers and two pending timeout ids)
 // ============================================================
 
 class DmenuView {
-    constructor(controller) {
-        this._controller = controller;
-
+    constructor() {
         this.actor = new St.BoxLayout({
             style_class: 'dmenu-container',
             vertical: false,
             reactive: true,
             can_focus: true,
         });
-
         this.actor.set_style(`padding: ${LAYOUT.CONTAINER_PADDING}px;`);
 
         this.leftBox = new St.BoxLayout({
@@ -954,7 +841,6 @@ class DmenuView {
             y_expand: true,
             visible: false,
         });
-
         this.previewBox.set_style(`margin: ${LAYOUT.PREVIEW_BOX_MARGIN}px;`);
 
         this.actor.add_child(this.leftBox);
@@ -996,24 +882,12 @@ class DmenuView {
         this.leftBox.add_child(this.resultsContainer);
 
         this._rowActors = [];
-        this._filterTimeoutId = null;
         this._scrollIdleId = null;
 
-        this.entry.get_clutter_text().connect(
-            'text-changed',
-            () => this._handleTextChanged()
-        );
+        this.entry.get_clutter_text().connect('text-changed', () => scheduleSearchUpdate());
+        this.entry.get_clutter_text().connect('activate', () => activate());
 
-        this.entry.get_clutter_text().connect(
-            'activate',
-            () => this._controller.activate()
-        );
-
-        this.actor.connect(
-            'key-press-event',
-            (actor, event) => this._controller.handleKeyPress(actor, event)
-        );
-
+        this.actor.connect('key-press-event', (actor, event) => handleKeyPress(actor, event));
         this.actor.connect('button-press-event', () => {
             this.entry.grab_key_focus();
             return Clutter.EVENT_STOP;
@@ -1025,43 +899,23 @@ class DmenuView {
         this.actor.destroy();
     }
 
-    show() {
-        this.actor.show();
-    }
-
-    hide() {
-        this.actor.hide();
-    }
+    show() { this.actor.show(); }
+    hide() { this.actor.hide(); }
 
     cancelPendingWork() {
-        if (this._filterTimeoutId) {
-            GLib.source_remove(this._filterTimeoutId);
-            this._filterTimeoutId = null;
-        }
-
         if (this._scrollIdleId) {
             GLib.source_remove(this._scrollIdleId);
             this._scrollIdleId = null;
         }
     }
 
-    setHint(text) {
-        this.entry.set_hint_text(text);
-    }
-
-    resetInput() {
-        this.entry.set_text('');
-    }
-
-    getQuery() {
-        return this.entry.get_text();
-    }
+    setHint(text) { this.entry.set_hint_text(text); }
+    resetInput() { this.entry.set_text(''); }
+    getQuery() { return this.entry.get_text(); }
 
     focusInput(isOpen) {
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-            if (isOpen)
-                this.entry.grab_key_focus();
-
+            if (isOpen) this.entry.grab_key_focus();
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -1075,7 +929,6 @@ class DmenuView {
         const computeRail = usableWidth => {
             let lw = Math.max(LAYOUT.LEFT_RAIL_MIN_WIDTH, Math.floor(usableWidth * LAYOUT.LEFT_RAIL_FRAC));
             let pw = usableWidth - lw - LAYOUT.RAIL_GAP;
-
             if (pw < LAYOUT.PREVIEW_MIN_WIDTH) {
                 lw = Math.max(LAYOUT.LEFT_RAIL_FALLBACK_WIDTH, usableWidth - LAYOUT.PREVIEW_MIN_WIDTH - LAYOUT.RAIL_GAP);
                 pw = usableWidth - lw - LAYOUT.RAIL_GAP;
@@ -1087,47 +940,32 @@ class DmenuView {
             if (fullscreen) {
                 totalWidth = monitor.width;
                 totalHeight = monitor.height;
-
                 [leftWidth, previewWidth] = computeRail(totalWidth - pad2);
-
                 this.leftBox.set_width(leftWidth);
                 this.previewBox.visible = true;
-
                 this.actor.set_width(totalWidth);
                 this.actor.set_height(totalHeight);
                 this.actor.set_position(monitor.x, monitor.y);
-
                 return { previewWidth, previewHeight: totalHeight };
             }
 
-            totalWidth = Math.min(
-                Math.floor(monitor.width * LAYOUT.CENTERED_WIDTH_FRAC),
-                monitor.width - 40
-            );
-            totalHeight = Math.min(
-                Math.floor(monitor.height * LAYOUT.CENTERED_HEIGHT_FRAC),
-                monitor.height - 40
-            );
-
+            totalWidth = Math.min(Math.floor(monitor.width * LAYOUT.CENTERED_WIDTH_FRAC), monitor.width - 40);
+            totalHeight = Math.min(Math.floor(monitor.height * LAYOUT.CENTERED_HEIGHT_FRAC), monitor.height - 40);
             [leftWidth, previewWidth] = computeRail(totalWidth);
-
             this.leftBox.set_width(leftWidth);
             this.previewBox.visible = true;
-
             this.actor.set_width(totalWidth);
             this.actor.set_height(totalHeight);
             this.actor.set_position(
                 monitor.x + Math.floor((monitor.width - totalWidth) / 2),
                 monitor.y + Math.floor((monitor.height - totalHeight) / 2)
             );
-
             return { previewWidth, previewHeight: totalHeight };
         }
 
         totalWidth = Math.min(LAYOUT.STDIN_MAX_WIDTH, monitor.width - LAYOUT.STDIN_MARGIN);
         totalHeight = Math.min(LAYOUT.STDIN_MAX_HEIGHT, monitor.height - LAYOUT.STDIN_VERTICAL_MARGIN);
         leftWidth = totalWidth - pad2;
-
         this.leftBox.set_width(leftWidth);
         this.previewBox.visible = false;
 
@@ -1201,21 +1039,16 @@ class DmenuView {
                 x_align: Clutter.ActorAlign.FILL,
                 y_align: Clutter.ActorAlign.CENTER,
             });
+            label.clutter_text.set_markup(highlightLabel(item.label, tokens));
 
-            label.clutter_text.set_markup(
-                highlightLabel(item.label, tokens)
-            );
-
-            if (iconActor)
-                row.add_child(iconActor);
-
+            if (iconActor) row.add_child(iconActor);
             row.add_child(label);
 
             const rowIndex = i;
 
             row.connect('enter-event', () => {
                 label.add_style_class_name('dmenu-result-hover');
-                this._controller.selectIndex(rowIndex);
+                selectIndex(rowIndex);
                 return Clutter.EVENT_PROPAGATE;
             });
 
@@ -1226,25 +1059,20 @@ class DmenuView {
 
             row.connect('button-press-event', (actor, event) => {
                 const button = event.get_button();
-
                 if (button === Clutter.BUTTON_SECONDARY) {
-                    this._controller.openContextMenu(item, row);
+                    openContextMenu(item, row);
                     return Clutter.EVENT_STOP;
                 }
-
                 if (button === Clutter.BUTTON_PRIMARY) {
                     label.remove_style_class_name('dmenu-result-hover');
                     label.add_style_class_name('dmenu-result-clicked');
-                    this._controller.selectIndex(rowIndex);
-
+                    selectIndex(rowIndex);
                     GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-                        this._controller.activate();
+                        activate();
                         return GLib.SOURCE_REMOVE;
                     });
-
                     return Clutter.EVENT_STOP;
                 }
-
                 return Clutter.EVENT_PROPAGATE;
             });
 
@@ -1255,40 +1083,34 @@ class DmenuView {
         this.scrollSelectedIntoView(selectedIndex);
     }
 
-    // NEW METHOD: Update only selection style and preview without rebuilding rows
     updateSelection(selectedIndex, visibleItems, showPreview) {
-        // Reset style on all rows
         for (let i = 0; i < this._rowActors.length; i++) {
             const row = this._rowActors[i];
             const label = row.get_last_child();
-            if (label && label.has_style_class_name) {
+            if (label && label.has_style_class_name)
                 label.remove_style_class_name('dmenu-result-selected');
-            }
         }
 
-        // Apply selected style to the new row
         if (selectedIndex >= 0 && selectedIndex < this._rowActors.length) {
             const row = this._rowActors[selectedIndex];
             const label = row.get_last_child();
-            if (label && label.add_style_class_name) {
+            if (label && label.add_style_class_name)
                 label.add_style_class_name('dmenu-result-selected');
-            }
         }
 
-        // Update preview if supported
         if (showPreview && visibleItems.length > 0) {
             const selectedItem = visibleItems[selectedIndex];
             if (selectedItem?.data instanceof Meta.Window) {
-                this._controller._preview.show(
+                state.preview.show(
                     selectedItem.data,
-                    this._controller._previewWidth,
-                    this._controller._previewHeight
+                    state.previewWidth,
+                    state.previewHeight
                 );
             } else {
-                this._controller._preview.hide();
+                state.preview.hide();
             }
         } else {
-            this._controller._preview.hide();
+            state.preview.hide();
         }
     }
 
@@ -1314,16 +1136,12 @@ class DmenuView {
                 track_hover: true,
             });
 
-            button.connect('clicked', () => {
-                this._controller.activatePinnedApp(app);
-            });
-
+            button.connect('clicked', () => activatePinnedApp(app));
             button.connect('button-press-event', (actor, event) => {
                 if (event.get_button() === Clutter.BUTTON_SECONDARY) {
-                    this._controller.openContextMenuForApp(app, button);
+                    openContextMenuForApp(app, button);
                     return Clutter.EVENT_STOP;
                 }
-
                 return Clutter.EVENT_PROPAGATE;
             });
 
@@ -1337,35 +1155,27 @@ class DmenuView {
     }
 
     scrollSelectedIntoView(index) {
-        if (this._rowActors.length === 0)
-            return;
-
+        if (this._rowActors.length === 0) return;
         const selectedRow = this._rowActors[index];
-        if (!selectedRow)
-            return;
+        if (!selectedRow) return;
 
-        const isOpen = () => this._controller.isOpen;
         const scrollView = this.resultsContainer;
 
         this._scrollIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
             this._scrollIdleId = null;
 
-            if (!isOpen() || !this._rowActors.includes(selectedRow))
+            if (!state.isOpen || !this._rowActors.includes(selectedRow))
                 return GLib.SOURCE_REMOVE;
 
             const adjustment = scrollView.vadjustment;
-            if (!adjustment)
-                return GLib.SOURCE_REMOVE;
+            if (!adjustment) return GLib.SOURCE_REMOVE;
 
             const lower = adjustment.lower || 0;
             const upper = adjustment.upper || 0;
 
             let pageSize = adjustment.page_size;
-            if (!pageSize)
-                pageSize = scrollView.height;
-
-            if (!pageSize)
-                return GLib.SOURCE_REMOVE;
+            if (!pageSize) pageSize = scrollView.height;
+            if (!pageSize) return GLib.SOURCE_REMOVE;
 
             let offset = 0;
             const vfade = scrollView.get_effect('fade');
@@ -1384,8 +1194,7 @@ class DmenuView {
                 parent = parent.get_parent();
             }
 
-            if (parent !== scrollView)
-                return GLib.SOURCE_REMOVE;
+            if (parent !== scrollView) return GLib.SOURCE_REMOVE;
 
             const currentValue = adjustment.value;
             let newValue = currentValue;
@@ -1400,8 +1209,7 @@ class DmenuView {
             const maxValue = Math.max(lower, upper - pageSize);
             newValue = Math.max(lower, Math.min(newValue, maxValue));
 
-            if (newValue === currentValue)
-                return GLib.SOURCE_REMOVE;
+            if (newValue === currentValue) return GLib.SOURCE_REMOVE;
 
             if (typeof adjustment.ease === 'function') {
                 adjustment.ease(newValue, {
@@ -1415,741 +1223,556 @@ class DmenuView {
             return GLib.SOURCE_REMOVE;
         });
     }
-
-    _handleTextChanged() {
-        this._controller.scheduleSearchUpdate();
-    }
 }
 
 // ============================================================
-// MAIN CONTROLLER
+// CONTROLLER (module functions operating on module state)
 // ============================================================
 
-class DmenuController {
-    constructor(service) {
-        this._service = service;
+function controllerSetup() {
+    state.favorites = AppFavorites.getAppFavorites();
 
-        this._search = new SearchModel();
-        this._selection = new SelectionModel();
+    state.view = new DmenuView();
 
-        this._windowMode = new WindowMode(this);
-        this._drunMode = new DrunMode(this);
-        this._pathMode = new PathMode(this);
-        this._genericMode = new GenericMode(this);
+    appMenuInit(state.view.actor);
 
-        this._mode = this._genericMode;
-        this._modeName = 'stdin';
+    state.preview = new WindowPreview(
+        state.view.previewBox,
+        window => windowModeHandleClosedWindow(window)
+    );
 
-        this._view = new DmenuView(this);
-        this._appMenu = new AppMenuController(this._view.actor);
-        this._preview = new WindowPreview(
-            this._view.previewBox,
-            window => this._windowMode.handleClosedWindow(window)
-        );
+    state.favoritesChangedId = state.favorites.connect('changed', () => {
+        if (!state.isOpen || state.modeName !== 'drun') return;
+        syncPinnedItems();
+        render();
+    });
+}
 
-        this._isOpen = false;
-        this._multi = false;
-        this._fullscreen = false;
-        this._filterTimeoutId = null;
-        this._showPreview = false;
-        this._previewWidth = 0;
-        this._previewHeight = 0;
-        this._currentVisibleItems = []; // added for optimization
+function controllerDestroy() {
+    closeMenu();
 
-        this._favoritesChangedId = this._drunMode.isFavoriteChangedListener(() => {
-            if (!this._isOpen || this._modeName !== 'drun')
-                return;
-
-            this._syncPinnedItems();
-            this._render();
-        });
+    if (state.favoritesChangedId) {
+        try { state.favorites.disconnect(state.favoritesChangedId); } catch (e) { /* ignore */ }
+        state.favoritesChangedId = 0;
     }
 
-    get isOpen() {
-        return this._isOpen;
+    state.preview.destroy();
+    state.view.destroy();
+}
+
+function showGeneric(items, multi = false, hint = null, fullscreen = false) {
+    openMenu('stdin', genericModeGetItems(items), multi, hint, fullscreen);
+}
+
+function showApps(multi = false, hint = null, fullscreen = false) {
+    openMenu('drun', drunModeGetItems(), multi, hint, fullscreen);
+}
+
+function showWindows(multi = false, hint = null, fullscreen = false) {
+    openMenu('window', windowModeGetItems(), multi, hint, fullscreen);
+}
+
+function showPaths(paths, multi = false, hint = null, fullscreen = false) {
+    openMenu('paths', pathModeGetItems(paths), multi, hint, fullscreen);
+}
+
+function openMenu(modeName, items, multi, hint, fullscreen) {
+    if (state.isOpen) closeMenu();
+
+    const capabilities = {
+        multi: false, hint: true, fullscreen: true, preview: false,
+        ...getModeCapabilities(modeName),
+    };
+
+    state.modeName = modeName;
+    state.multi = capabilities.multi ? Boolean(multi) : false;
+    state.fullscreen = capabilities.fullscreen ? Boolean(fullscreen) : false;
+    state.showPreview = Boolean(capabilities.preview);
+    state.isOpen = true;
+
+    searchSetItems(items);
+    selectionReset();
+
+    state.view.cancelPendingWork();
+    state.view.resetInput();
+
+    setHint(capabilities.hint ? hint : null);
+
+    const layout = state.view.configureLayout(state.showPreview, state.fullscreen);
+    state.previewWidth = layout.previewWidth;
+    state.previewHeight = layout.previewHeight;
+
+    Main.layoutManager.addChrome(state.view.actor, { affectsInputRegion: true });
+
+    state.view.focusInput(state.isOpen);
+    renderPinnedBar();
+    searchSetQuery('');
+    render();
+}
+
+function closeMenu() {
+    if (state.filterTimeoutId) {
+        GLib.source_remove(state.filterTimeoutId);
+        state.filterTimeoutId = 0;
     }
 
-    show(items, multi = false, hint = null, fullscreen = false) {
-        const options = DmenuOptions.from(multi, hint, fullscreen);
+    state.view.cancelPendingWork();
+    appMenuClose();
+    state.preview.hide();
 
-        this._open(
-            'stdin',
-            this._genericMode,
-            this._genericMode.getItems(items),
-            options
-        );
+    if (!state.isOpen) return;
+
+    state.view.clearPinnedApps();
+    Main.layoutManager.removeChrome(state.view.actor);
+    state.isOpen = false;
+
+    searchSetItems([]);
+    selectionReset();
+}
+
+function setHint(hint) {
+    if (hint) { state.view.setHint(hint); return; }
+
+    if (state.modeName === 'drun') {
+        state.view.setHint('Type to filter · Enter: launch · Ctrl+P: pin/unpin · Super/Esc: cancel');
+    } else if (state.multi) {
+        state.view.setHint('Type to filter · Enter: select · Tab: multi-select · Esc: cancel');
+    } else {
+        state.view.setHint('Type to filter · Enter: select · Esc: cancel');
     }
+}
 
-    showApps(multi = false, hint = null, fullscreen = false) {
-        const options = DmenuOptions.from(multi, hint, fullscreen);
+function render() {
+    const items = state.search.visibleItems;
 
-        this._open(
-            'drun',
-            this._drunMode,
-            this._drunMode.getItems(),
-            options
-        );
+    state.view.renderResults(
+        items,
+        state.search.tokens,
+        state.selection.index,
+        state.selection.selectedIds,
+        state.modeName,
+        state.multi
+    );
+
+    updateSelectionOnly();
+}
+
+function renderPinnedBar() {
+    if (state.modeName !== 'drun') {
+        state.view.clearPinnedApps();
+        return;
     }
+    state.view.renderPinnedApps(drunModeGetFavorites());
+}
 
-    showWindows(multi = false, hint = null, fullscreen = false) {
-        const options = DmenuOptions.from(multi, hint, fullscreen);
+function syncPinnedItems() {
+    if (state.modeName !== 'drun') return;
 
-        this._open(
-            'window',
-            this._windowMode,
-            this._windowMode.getItems(),
-            options
-        );
-    }
+    const favoriteIds = new Set(drunModeGetFavorites().map(app => app.get_id()));
+    for (const item of state.search.allItems)
+        item.pinned = favoriteIds.has(item.id);
 
-    showPaths(paths, multi = false, hint = null, fullscreen = false) {
-        const options = DmenuOptions.from(multi, hint, fullscreen);
+    renderPinnedBar();
+}
 
-        this._open(
-            'paths',
-            this._pathMode,
-            this._pathMode.getItems(paths),
-            options
-        );
-    }
+function togglePinCurrent() {
+    const items = state.search.visibleItems;
+    if (items.length === 0) return;
+    const item = items[state.selection.index];
+    if (!item) return;
+    drunModeTogglePin(item);
+}
 
-    hide() {
-        this._closeInternal();
-    }
+function toggleCurrent() {
+    const items = state.search.visibleItems;
+    if (items.length === 0) return;
+    selectionToggle(items[state.selection.index]);
+}
 
-    destroy() {
-        this._closeInternal();
+function getActivationItems() {
+    const items = state.search.visibleItems;
 
-        if (this._favoritesChangedId) {
-            this._drunMode.disconnectFavoriteListener(this._favoritesChangedId);
-            this._favoritesChangedId = 0;
+    if (state.multi && state.selection.selectedIds.size > 0)
+        return selectionGetSelectedItems(items);
+
+    if (items.length > 0 && state.selection.index < items.length)
+        return [items[state.selection.index]];
+
+    return [];
+}
+
+function selectIndex(index) {
+    const count = state.search.visibleItems.length;
+    if (count === 0) return;
+
+    const newIndex = Math.max(0, Math.min(index, count - 1));
+    if (state.selection.index === newIndex) return;
+
+    state.selection.index = newIndex;
+    updateSelectionOnly();
+}
+
+function updateSelectionOnly() {
+    state.view.updateSelection(
+        state.selection.index,
+        state.search.visibleItems,
+        state.showPreview
+    );
+}
+
+function removeItemByData(data) {
+    const removed = searchRemoveItemByData(data);
+    if (!removed) return;
+
+    const visible = searchSetQuery(state.view.getQuery());
+    selectionClamp(visible.length);
+
+    state.selection.selectedIds.forEach(id => {
+        if (!state.search.allItems.some(item => item.id === id))
+            state.selection.selectedIds.delete(id);
+    });
+
+    render();
+}
+
+function scheduleSearchUpdate() {
+    if (state.filterTimeoutId)
+        GLib.source_remove(state.filterTimeoutId);
+
+    state.filterTimeoutId = GLib.timeout_add(
+        GLib.PRIORITY_DEFAULT,
+        FILTER_DEBOUNCE_MS,
+        () => {
+            state.filterTimeoutId = 0;
+            if (!state.isOpen) return GLib.SOURCE_REMOVE;
+
+            appMenuClose();
+            state.selection.index = 0;
+            searchSetQuery(state.view.getQuery());
+            render();
+
+            return GLib.SOURCE_REMOVE;
         }
+    );
+}
 
-        this._preview.destroy();
-        this._view.destroy();
+function handleKeyPress(actor, event) {
+    const sym = event.get_key_symbol();
+    const mods = event.get_state();
+    const visibleCount = state.search.visibleItems.length;
+
+    if (sym === Clutter.KEY_Escape) {
+        serviceEmitCancelled();
+        closeMenu();
+        return Clutter.EVENT_STOP;
     }
 
-    // OPTIMIZED: only updates selection and preview, no full rebuild
-    selectIndex(index) {
-        const count = this._search.visibleItems.length;
-        if (count === 0)
-            return;
-
-        const newIndex = Math.max(0, Math.min(index, count - 1));
-        if (this._selection.index === newIndex)
-            return; // no change
-
-        this._selection.index = newIndex;
-        this._updateSelectionOnly(); // fast path
+    if (sym === Clutter.KEY_Down) {
+        if (visibleCount > 0) {
+            appMenuClose();
+            selectionMoveDown(visibleCount);
+            updateSelectionOnly();
+        }
+        return Clutter.EVENT_STOP;
     }
 
-    // NEW: update selection and preview without rebuilding rows
-    _updateSelectionOnly() {
-        const items = this._search.visibleItems;
-        this._view.updateSelection(
-            this._selection.index,
-            items,
-            this._showPreview
-        );
+    if (sym === Clutter.KEY_Up) {
+        if (visibleCount > 0) {
+            appMenuClose();
+            selectionMoveUp(visibleCount);
+            updateSelectionOnly();
+        }
+        return Clutter.EVENT_STOP;
     }
 
-    removeItemByData(data) {
-        const removed = this._search.removeItemByData(data);
-        if (!removed)
-            return;
-
-        const visible = this._search.setQuery(this._view.getQuery());
-        this._selection.clamp(visible.length);
-        this._selection.selectedIds.forEach(id => {
-            if (!this._search.allItems.some(item => item.id === id))
-                this._selection.selectedIds.delete(id);
-        });
-
-        this._render();
+    if (state.modeName === 'drun' &&
+        sym === Clutter.KEY_p &&
+        (mods & Clutter.ModifierType.CONTROL_MASK)) {
+        togglePinCurrent();
+        return Clutter.EVENT_STOP;
     }
 
-    scheduleSearchUpdate() {
-        if (this._filterTimeoutId)
-            GLib.source_remove(this._filterTimeoutId);
-
-        this._filterTimeoutId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT,
-            FILTER_DEBOUNCE_MS,
-            () => {
-                this._filterTimeoutId = null;
-
-                if (!this._isOpen)
-                    return GLib.SOURCE_REMOVE;
-
-                this._appMenu.close();
-                this._selection.index = 0;
-                this._search.setQuery(this._view.getQuery());
-                this._render();
-
-                return GLib.SOURCE_REMOVE;
-            }
-        );
-    }
-
-    handleKeyPress(actor, event) {
-        const sym = event.get_key_symbol();
-        const mods = event.get_state();
-        const visibleCount = this._search.visibleItems.length;
-
-        if (sym === Clutter.KEY_Escape) {
-            this._service.emitCancelled();
-            this.hide();
-            return Clutter.EVENT_STOP;
-        }
-
-        if (sym === Clutter.KEY_Down) {
-            if (visibleCount > 0) {
-                this._appMenu.close();
-                this._selection.moveDown(visibleCount);
-                this._updateSelectionOnly();
-            }
-            return Clutter.EVENT_STOP;
-        }
-
-        if (sym === Clutter.KEY_Up) {
-            if (visibleCount > 0) {
-                this._appMenu.close();
-                this._selection.moveUp(visibleCount);
-                this._updateSelectionOnly();
-            }
-            return Clutter.EVENT_STOP;
-        }
-
-        if (this._modeName === 'drun' &&
-            sym === Clutter.KEY_p &&
-            (mods & Clutter.ModifierType.CONTROL_MASK)) {
-            this._togglePinCurrent();
-            return Clutter.EVENT_STOP;
-        }
-
-        if (!this._multi)
-            return Clutter.EVENT_PROPAGATE;
-
-        if (sym === Clutter.KEY_Tab) {
-            this._toggleCurrent();
-            this._selection.next(visibleCount);
-            this._updateSelectionOnly();
-            return Clutter.EVENT_STOP;
-        }
-
-        if (sym === Clutter.KEY_space &&
-            (mods & Clutter.ModifierType.CONTROL_MASK)) {
-            this._toggleCurrent();
-            this._updateSelectionOnly();
-            return Clutter.EVENT_STOP;
-        }
-
-        if ((sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) &&
-            (mods & Clutter.ModifierType.SHIFT_MASK)) {
-            this._toggleCurrent();
-            this._selection.next(visibleCount);
-            this._updateSelectionOnly();
-            return Clutter.EVENT_STOP;
-        }
-
+    if (!state.multi)
         return Clutter.EVENT_PROPAGATE;
+
+    if (sym === Clutter.KEY_Tab) {
+        toggleCurrent();
+        selectionNext(visibleCount);
+        updateSelectionOnly();
+        return Clutter.EVENT_STOP;
     }
 
-    activate() {
-        const selectedItems = this._getActivationItems();
-        let resultLabels = [];
-
-        if (selectedItems.length > 0) {
-            if (this._modeName === 'drun') {
-                selectedItems.forEach(item => this._drunMode.activate(item));
-                resultLabels = selectedItems.map(item => item.label);
-            } else if (this._modeName === 'window') {
-                selectedItems.forEach(item => this._windowMode.activate(item));
-                resultLabels = selectedItems.map(item => item.label);
-            } else if (this._modeName === 'paths') {
-                resultLabels = selectedItems
-                    .map(item => this._pathMode.activate(item))
-                    .filter(value => value !== null && value !== undefined);
-            } else {
-                resultLabels = selectedItems
-                    .map(item => this._genericMode.activate(item))
-                    .filter(value => value !== null && value !== undefined);
-            }
-        } else if (this._view.getQuery()) {
-            resultLabels = [this._view.getQuery()];
-        }
-
-        if (resultLabels.length > 0)
-            this._service.emitSelected(resultLabels);
-        else
-            this._service.emitCancelled();
-
-        this.hide();
+    if (sym === Clutter.KEY_space && (mods & Clutter.ModifierType.CONTROL_MASK)) {
+        toggleCurrent();
+        updateSelectionOnly();
+        return Clutter.EVENT_STOP;
     }
 
-    activatePinnedApp(app) {
-        this._drunMode.activatePinned(app);
-        this._service.emitSelected([app.get_name()]);
-        this.hide();
+    if ((sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter) &&
+        (mods & Clutter.ModifierType.SHIFT_MASK)) {
+        toggleCurrent();
+        selectionNext(visibleCount);
+        updateSelectionOnly();
+        return Clutter.EVENT_STOP;
     }
 
-    openContextMenu(item, sourceActor) {
-        if (this._modeName !== 'drun')
-            return;
+    return Clutter.EVENT_PROPAGATE;
+}
 
-        if (!item?.shellApp) {
-            journal(`No Shell.App available for ${item?.label || 'unknown item'}`, true);
-            return;
-        }
+function activate() {
+    const selectedItems = getActivationItems();
+    let resultLabels = [];
 
-        this._appMenu.openForApp(sourceActor, item.shellApp);
-    }
-
-    openContextMenuForApp(app, sourceActor) {
-        this._appMenu.openForApp(sourceActor, app);
-    }
-
-    _open(modeName, mode, items, options) {
-        if (this._isOpen)
-            this._closeInternal();
-
-        const capabilities = {
-            multi: false,
-            hint: true,
-            fullscreen: true,
-            preview: false,
-            ...(typeof mode.getCapabilities === 'function'
-                ? mode.getCapabilities()
-                : {}),
-        };
-
-        const requested = options instanceof DmenuOptions
-            ? options
-            : new DmenuOptions(options);
-
-        const effectiveOptions = new DmenuOptions({
-            multi: capabilities.multi ? requested.multi : false,
-            hint: capabilities.hint ? requested.hint : null,
-            fullscreen: capabilities.fullscreen ? requested.fullscreen : false,
-        });
-
-        this._modeName = modeName;
-        this._mode = mode;
-        this._multi = effectiveOptions.multi;
-        this._fullscreen = effectiveOptions.fullscreen;
-        this._isOpen = true;
-
-        this._search.setItems(items);
-        this._selection.reset();
-
-        this._showPreview = Boolean(capabilities.preview);
-
-        this._view.cancelPendingWork();
-        this._view.resetInput();
-        this._setHint(effectiveOptions.hint);
-
-        const layout = this._view.configureLayout(
-            this._showPreview,
-            effectiveOptions.fullscreen
-        );
-
-        this._previewWidth = layout.previewWidth;
-        this._previewHeight = layout.previewHeight;
-
-        Main.layoutManager.addChrome(this._view.actor, {
-            affectsInputRegion: true,
-        });
-
-        this._view.focusInput(this._isOpen);
-        this._renderPinnedBar();
-        this._search.setQuery('');
-        this._render();
-    }
-
-    _closeInternal() {
-        if (this._filterTimeoutId) {
-            GLib.source_remove(this._filterTimeoutId);
-            this._filterTimeoutId = null;
-        }
-
-        this._view.cancelPendingWork();
-        this._appMenu.close();
-        this._preview.hide();
-
-        if (!this._isOpen)
-            return;
-
-        this._view.clearPinnedApps();
-        Main.layoutManager.removeChrome(this._view.actor);
-        this._isOpen = false;
-
-        this._search.setItems([]);
-        this._selection.reset();
-    }
-
-    _setHint(hint) {
-        if (hint) {
-            this._view.setHint(hint);
-            return;
-        }
-
-        if (this._modeName === 'drun') {
-            this._view.setHint(
-                'Type to filter · Enter: launch · Ctrl+P: pin/unpin · Super/Esc: cancel'
-            );
-        } else if (this._multi) {
-            this._view.setHint(
-                'Type to filter · Enter: select · Tab: multi-select · Esc: cancel'
-            );
+    if (selectedItems.length > 0) {
+        if (state.modeName === 'drun') {
+            selectedItems.forEach(item => activateInMode('drun', item));
+            resultLabels = selectedItems.map(item => item.label);
+        } else if (state.modeName === 'window') {
+            selectedItems.forEach(item => activateInMode('window', item));
+            resultLabels = selectedItems.map(item => item.label);
+        } else if (state.modeName === 'paths') {
+            resultLabels = selectedItems
+                .map(item => activateInMode('paths', item))
+                .filter(value => value !== null && value !== undefined);
         } else {
-            this._view.setHint(
-                'Type to filter · Enter: select · Esc: cancel'
+            resultLabels = selectedItems
+                .map(item => activateInMode('stdin', item))
+                .filter(value => value !== null && value !== undefined);
+        }
+    } else if (state.view.getQuery()) {
+        resultLabels = [state.view.getQuery()];
+    }
+
+    if (resultLabels.length > 0)
+        serviceEmitSelected(resultLabels);
+    else
+        serviceEmitCancelled();
+
+    closeMenu();
+}
+
+function activatePinnedApp(app) {
+    drunModeActivate({ data: app });
+    serviceEmitSelected([app.get_name()]);
+    closeMenu();
+}
+
+function openContextMenu(item, sourceActor) {
+    if (state.modeName !== 'drun') return;
+
+    if (!item?.shellApp) {
+        journal(`No Shell.App available for ${item?.label || 'unknown item'}`, true);
+        return;
+    }
+
+    appMenuOpenForApp(sourceActor, item.shellApp);
+}
+
+function openContextMenuForApp(app, sourceActor) {
+    appMenuOpenForApp(sourceActor, app);
+}
+
+// ============================================================
+// DBUS SERVICE (module functions)
+// ============================================================
+
+const dbusMethods = {
+    Show(items, multi, hint, fullscreen) { showGeneric(items, multi, hint, fullscreen); },
+    ShowApps(multi, hint, fullscreen) { showApps(multi, hint, fullscreen); },
+    ShowWindows(multi, hint, fullscreen) { showWindows(multi, hint, fullscreen); },
+    ShowPaths(paths, multi, hint, fullscreen) { showPaths(paths, multi, hint, fullscreen); },
+};
+
+function serviceEmitSelected(items) {
+    state.dbusImpl.emit_signal('Selected', GLib.Variant.new('(as)', [items]));
+}
+
+function serviceEmitCancelled() {
+    state.dbusImpl.emit_signal('Cancelled', null);
+}
+
+function serviceExport() {
+    serviceUnexport();
+
+    if (state.ownerId) {
+        Gio.bus_unown_name(state.ownerId);
+        state.ownerId = 0;
+    }
+
+    state.dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_INTERFACE, dbusMethods);
+
+    state.ownerId = Gio.bus_own_name(
+        Gio.BusType.SESSION,
+        BUS_NAME,
+        Gio.BusNameOwnerFlags.NONE,
+        connection => {
+            try {
+                state.dbusImpl.export(connection, OBJECT_PATH);
+                journal(`D-Bus interface exported on ${OBJECT_PATH}`);
+            } catch (e) {
+                journal(`Failed to export D-Bus interface: ${e.message}`, true);
+            }
+        },
+        (connection, name) => {
+            journal(`${name}: name acquired`);
+        },
+        (connection, name) => {
+            journal(`${name}: name lost — another instance may already own it`, true);
+            serviceUnexport();
+            state.ownerId = 0;
+        }
+    );
+}
+
+function serviceUnexport() {
+    if (state.ownerId) {
+        Gio.bus_unown_name(state.ownerId);
+        state.ownerId = 0;
+    }
+
+    try {
+        if (state.dbusImpl) {
+            state.dbusImpl.unexport();
+        }
+    } catch (e) {
+        if (!e.message.includes('not exported')) {
+            journal(`Failed to unexport D-Bus interface: ${e.message}`, true);
+        }
+    }
+}
+
+// ============================================================
+// SPEC CACHE / CLI
+// ============================================================
+
+function writeSpecCache() {
+    try {
+        GLib.mkdir_with_parents(SPEC_CACHE_DIR, 0o755);
+        const spec = {
+            bus_name: BUS_NAME,
+            object_path: OBJECT_PATH,
+            xml: DBUS_INTERFACE,
+        };
+        const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, SPEC_CACHE_FILE]);
+        GLib.file_set_contents(filePath, JSON.stringify(spec, null, 2));
+        journal(`Wrote spec cache to ${filePath}`);
+    } catch (e) {
+        journal(`Failed to write spec cache: ${e.message}`, true);
+    }
+}
+
+function removeSpecCache() {
+    try {
+        const filePath = GLib.build_filenamev([SPEC_CACHE_DIR, SPEC_CACHE_FILE]);
+        const file = Gio.File.new_for_path(filePath);
+        if (file.query_exists(null)) {
+            file.delete(null);
+            journal('Removed spec cache');
+        }
+    } catch (e) {
+        journal(`Failed to remove spec cache: ${e.message}`, true);
+    }
+}
+
+function installCli(extensionPath) {
+    const cliScript = GLib.build_filenamev([extensionPath, 'cli', 'gdmenu']);
+    const binDir = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin']);
+    const symlinkPath = GLib.build_filenamev([binDir, 'gdmenu']);
+
+    try {
+        GLib.chmod(cliScript, 0o755);
+        GLib.mkdir_with_parents(binDir, 0o755);
+
+        const linkFile = Gio.File.new_for_path(symlinkPath);
+
+        if (linkFile.query_exists(null)) {
+            const info = linkFile.query_info(
+                Gio.FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
+                Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                null
             );
+            if (info.get_symlink_target() !== cliScript) {
+                linkFile.delete(null);
+                linkFile.make_symbolic_link(cliScript, null);
+                journal(`Updated CLI symlink: ${symlinkPath}`);
+            }
+        } else {
+            linkFile.make_symbolic_link(cliScript, null);
+            journal(`Created CLI symlink: ${symlinkPath}`);
         }
+    } catch (e) {
+        journal(`Failed to setup CLI symlink: ${e.message}`, true);
     }
+}
 
-    // OPTIMIZED: full rebuild (rows) only when filter changes
-    _render() {
-        const items = this._search.visibleItems;
-        this._currentVisibleItems = items;
+function removeCliSymlink(extensionPath) {
+    const cliScript = GLib.build_filenamev([extensionPath, 'cli', 'gdmenu']);
+    const symlinkPath = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'gdmenu']);
 
-        this._view.renderResults(
-            items,
-            this._search.tokens,
-            this._selection.index,
-            this._selection.selectedIds,
-            this._modeName,
-            this._multi
-        );
-
-        // Now update the selection and preview using the newly built rows
-        this._updateSelectionOnly();
-    }
-
-    _renderPinnedBar() {
-        if (this._modeName !== 'drun') {
-            this._view.clearPinnedApps();
-            return;
+    try {
+        const linkFile = Gio.File.new_for_path(symlinkPath);
+        if (linkFile.query_exists(null)) {
+            const info = linkFile.query_info(
+                Gio.FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
+                Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                null
+            );
+            if (info.get_symlink_target() === cliScript) {
+                linkFile.delete(null);
+                journal('Removed CLI symlink');
+            }
         }
-
-        this._view.renderPinnedApps(this._drunMode.getFavorites());
-    }
-
-    _syncPinnedItems() {
-        if (this._modeName !== 'drun')
-            return;
-
-        const favoriteIds = new Set(
-            this._drunMode.getFavorites().map(app => app.get_id())
-        );
-
-        for (const item of this._search.allItems)
-            item.pinned = favoriteIds.has(item.id);
-
-        this._renderPinnedBar();
-    }
-
-    _togglePinCurrent() {
-        const items = this._search.visibleItems;
-        if (items.length === 0)
-            return;
-
-        const item = items[this._selection.index];
-        if (!item)
-            return;
-
-        this._drunMode.togglePin(item);
-    }
-
-    _toggleCurrent() {
-        const items = this._search.visibleItems;
-        if (items.length === 0)
-            return;
-
-        this._selection.toggle(items[this._selection.index]);
-    }
-
-    _getActivationItems() {
-        const items = this._search.visibleItems;
-
-        if (this._multi && this._selection.selectedIds.size > 0)
-            return this._selection.getSelectedItems(items);
-
-        if (items.length > 0 && this._selection.index < items.length)
-            return [items[this._selection.index]];
-
-        return [];
+    } catch (e) {
+        journal(`Failed to remove CLI symlink: ${e.message}`, true);
     }
 }
 
 // ============================================================
-// DBUS SERVICE
-// ============================================================
-
-class DmenuService {
-    constructor(extension) {
-        this._extension = extension;
-        this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(
-            DBUS_INTERFACE,
-            this
-        );
-        this._ownerId = null;
-    }
-
-    Show(items, multi, hint, fullscreen) {
-        this._extension.show(items, multi, hint, fullscreen);
-    }
-
-    ShowApps(multi, hint, fullscreen) {
-        this._extension.showApps(multi, hint, fullscreen);
-    }
-
-    ShowWindows(multi, hint, fullscreen) {
-        this._extension.showWindows(multi, hint, fullscreen);
-    }
-
-    ShowPaths(paths, multi, hint, fullscreen) {
-        this._extension.showPaths(paths, multi, hint, fullscreen);
-    }
-
-    emitSelected(items) {
-        this._dbusImpl.emit_signal(
-            'Selected',
-            GLib.Variant.new('(as)', [items])
-        );
-    }
-
-    emitCancelled() {
-        this._dbusImpl.emit_signal('Cancelled', null);
-    }
-
-    export() {
-        this._unexportInterface();
-
-        if (this._ownerId) {
-            Gio.bus_unown_name(this._ownerId);
-            this._ownerId = null;
-        }
-
-        this._ownerId = Gio.bus_own_name(
-            Gio.BusType.SESSION,
-            BUS_NAME,
-            Gio.BusNameOwnerFlags.NONE,
-            connection => {
-                try {
-                    this._dbusImpl.export(connection, OBJECT_PATH);
-                    journal(`D-Bus interface exported on ${OBJECT_PATH}`);
-                    this._exported = true;
-                } catch (e) {
-                    journal(
-                        `Failed to export D-Bus interface: ${e.message}`,
-                        true
-                    );
-                    this._exported = false;
-                }
-            },
-            (connection, name) => {
-                journal(`${name}: name acquired`);
-            },
-            (connection, name) => {
-                journal(
-                    `${name}: name lost — another instance may already own it`,
-                    true
-                );
-                this._unexportInterface();
-                this._ownerId = null;
-            }
-        );
-    }
-
-    unexport() {
-        if (this._ownerId) {
-            Gio.bus_unown_name(this._ownerId);
-            this._ownerId = null;
-        }
-
-        this._unexportInterface();
-    }
-
-    _unexportInterface() {
-        try {
-            if (this._dbusImpl) {
-                this._dbusImpl.unexport();
-                this._exported = false;
-            }
-        } catch (e) {
-            if (!e.message.includes('not exported')) {
-                journal(
-                    `Failed to unexport D-Bus interface: ${e.message}`,
-                    true
-                );
-            }
-        }
-    }
-}
-
-// ============================================================
-// GNOME SHELL EXTENSION
+// EXTENSION ENTRY POINT
+//
+// This class exists only because GNOME Shell requires an Extension subclass
+// and because enable/disable hooks and this.path come from it. All the real
+// work is done by the module-level functions above.
 // ============================================================
 
 export default class SimpleDmenuExtension extends Extension {
-    _writeSpecCache() {
-        try {
-            GLib.mkdir_with_parents(SPEC_CACHE_DIR, 0o755);
-
-            const spec = {
-                bus_name: BUS_NAME,
-                object_path: OBJECT_PATH,
-                xml: DBUS_INTERFACE,
-            };
-
-            const filePath = GLib.build_filenamev([
-                SPEC_CACHE_DIR,
-                SPEC_CACHE_FILE,
-            ]);
-
-            GLib.file_set_contents(
-                filePath,
-                JSON.stringify(spec, null, 2)
-            );
-
-            journal(`Wrote spec cache to ${filePath}`);
-        } catch (e) {
-            journal(`Failed to write spec cache: ${e.message}`, true);
-        }
-    }
-
-    _removeSpecCache() {
-        try {
-            const filePath = GLib.build_filenamev([
-                SPEC_CACHE_DIR,
-                SPEC_CACHE_FILE,
-            ]);
-
-            const file = Gio.File.new_for_path(filePath);
-
-            if (file.query_exists(null)) {
-                file.delete(null);
-                journal('Removed spec cache');
-            }
-        } catch (e) {
-            journal(`Failed to remove spec cache: ${e.message}`, true);
-        }
-    }
-
-    _installCli() {
-        const cliScript = GLib.build_filenamev([
-            this.path,
-            'cli',
-            'gdmenu',
-        ]);
-        const binDir = GLib.build_filenamev([
-            GLib.get_home_dir(),
-            '.local',
-            'bin',
-        ]);
-        const symlinkPath = GLib.build_filenamev([
-            binDir,
-            'gdmenu',
-        ]);
-
-        try {
-            GLib.chmod(cliScript, 0o755);
-            GLib.mkdir_with_parents(binDir, 0o755);
-
-            const linkFile = Gio.File.new_for_path(symlinkPath);
-
-            if (linkFile.query_exists(null)) {
-                const info = linkFile.query_info(
-                    Gio.FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
-                    Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
-                    null
-                );
-
-                if (info.get_symlink_target() !== cliScript) {
-                    linkFile.delete(null);
-                    linkFile.make_symbolic_link(cliScript, null);
-                    journal(`Updated CLI symlink: ${symlinkPath}`);
-                }
-            } else {
-                linkFile.make_symbolic_link(cliScript, null);
-                journal(`Created CLI symlink: ${symlinkPath}`);
-            }
-        } catch (e) {
-            journal(`Failed to setup CLI symlink: ${e.message}`, true);
-        }
-    }
-
-    _removeCliSymlink() {
-        const cliScript = GLib.build_filenamev([
-            this.path,
-            'cli',
-            'gdmenu',
-        ]);
-        const symlinkPath = GLib.build_filenamev([
-            GLib.get_home_dir(),
-            '.local',
-            'bin',
-            'gdmenu',
-        ]);
-
-        try {
-            const linkFile = Gio.File.new_for_path(symlinkPath);
-
-            if (linkFile.query_exists(null)) {
-                const info = linkFile.query_info(
-                    Gio.FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
-                    Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
-                    null
-                );
-
-                if (info.get_symlink_target() === cliScript) {
-                    linkFile.delete(null);
-                    journal('Removed CLI symlink');
-                }
-            }
-        } catch (e) {
-            journal(`Failed to remove CLI symlink: ${e.message}`, true);
-        }
-    }
-
     enable() {
         initLogging(this.uuid, 'both', false);
         journal(`Enabled`);
 
-        this._service = new DmenuService(this);
-        this._service.export();
+        resetState();
+        state.extensionPath = this.path;
 
-        this._controller = new DmenuController(this._service);
+        controllerSetup();
+        serviceExport();
 
-        this._installCli();
-        this._writeSpecCache();
+        installCli(this.path);
+        writeSpecCache();
     }
 
     disable() {
-        this._controller?.destroy();
-        this._controller = null;
+        controllerDestroy();
+        serviceUnexport();
 
-        this._service?.unexport();
-        this._service = null;
+        removeCliSymlink(this.path);
+        removeSpecCache();
 
-        this._removeCliSymlink();
-        this._removeSpecCache();
+        resetState();
     }
 
     show(items, multi = false, hint = null, fullscreen = false) {
-        this._controller.show(items, multi, hint, fullscreen);
+        showGeneric(items, multi, hint, fullscreen);
     }
 
     showApps(multi = false, hint = null, fullscreen = false) {
-        this._controller.showApps(multi, hint, fullscreen);
+        showApps(multi, hint, fullscreen);
     }
 
     showWindows(multi = false, hint = null, fullscreen = false) {
-        this._controller.showWindows(multi, hint, fullscreen);
+        showWindows(multi, hint, fullscreen);
     }
 
     showPaths(paths, multi = false, hint = null, fullscreen = false) {
-        this._controller.showPaths(paths, multi, hint, fullscreen);
+        showPaths(paths, multi, hint, fullscreen);
     }
 }
